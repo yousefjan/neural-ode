@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
@@ -182,6 +183,38 @@ static void dynmlp_init(DynMLP *net, int D, int H, double *theta, RNG *r) {
     bias_init(b1, H);
     xavier_init(W2, H, D, r);
     bias_init(b2, D);
+}
+
+static void dynmlp_forward(const DynMLP *net, const double *theta,
+                           const double *z, double t, double *out) {
+    int D = net->D, H = net->H;
+    const double *W1 = theta + DYNMLP_W1(D, H);
+    const double *b1 = theta + DYNMLP_b1(D, H);
+    const double *W2 = theta + DYNMLP_W2(D, H);
+    const double *b2 = theta + DYNMLP_b2(D, H);
+
+    double *x     = vec_alloc(D + 1);
+    double *h_pre = vec_alloc(H);
+    double *h     = vec_alloc(H);
+
+    /* x = [z; t], length D+1 */
+    vec_copy(z, x, D);
+    x[D] = t;
+
+    /* h_pre = W1 * x + b1, length H */
+    mat_vec(W1, x, h_pre, H, D + 1);
+    vec_add_scaled(h_pre, 1.0, b1, H);
+
+    /* h = tanh(h_pre), length H */
+    act_tanh(h_pre, h, H);
+
+    /* out = W2 * h + b2, length D */
+    mat_vec(W2, h, out, D, H);
+    vec_add_scaled(out, 1.0, b2, D);
+
+    free(x);
+    free(h_pre);
+    free(h);
 }
 
 
