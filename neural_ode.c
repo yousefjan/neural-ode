@@ -36,7 +36,6 @@ static double rng_normal(RNG *r) {
     return sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
 }
 
-
 static void *xmalloc(size_t n) {
     void *p = malloc(n);
     if (!p) {
@@ -54,7 +53,6 @@ static void *xcalloc(size_t count, size_t size) {
     }
     return p;
 }
-
 
 static double *vec_alloc(int n) {
     return (double *)xmalloc((size_t)n * sizeof(double));
@@ -136,7 +134,6 @@ static void xavier_init(double *w, int fan_in, int fan_out, RNG *r) {
 static void bias_init(double *b, int n) {
     vec_zero(b, n);
 }
-
 
 static void act_tanh(const double *x, double *dst, int n) {
     for (int i = 0; i < n; i++)
@@ -275,6 +272,262 @@ static void dynmlp_vjp(const DynMLP *net, const double *theta,
     free(dx);
 }
 
+/* --- ODE Solver: Dormand-Prince RK45 --- */
+
+typedef void (*ode_rhs_fn)(const double *state, double t, const double *params,
+                           int dim, double *out, void *ctx);
+
+typedef struct {
+    double *y;  /* final state, length dim — caller must free */
+    int nfe;    /* total number of f evaluations */
+} ODEResult;
+
+/* Butcher tableau nodes */
+static const double dp_c[7] = {
+    0.0, 1.0/5.0, 3.0/10.0, 4.0/5.0, 8.0/9.0, 1.0, 1.0
+};
+
+/* a coefficients, row by row (lower triangular) */
+static const double dp_a2[1] = { 1.0/5.0 };
+static const double dp_a3[2] = { 3.0/40.0, 9.0/40.0 };
+static const double dp_a4[3] = { 44.0/45.0, -56.0/15.0, 32.0/9.0 };
+static const double dp_a5[4] = { 19372.0/6561.0, -25360.0/2187.0,
+                                  64448.0/6561.0,   -212.0/729.0 };
+static const double dp_a6[5] = { 9017.0/3168.0, -355.0/33.0,
+                                  46732.0/5247.0,   49.0/176.0, -5103.0/18656.0 };
+
+/* 5th-order weights (b); b7=0 so FSAL: stage-7 input == y5 */
+static const double dp_b[7] = {
+    35.0/384.0, 0.0, 500.0/1113.0, 125.0/192.0, -2187.0/6784.0, 11.0/84.0, 0.0
+};
+
+/* 4th-order weights (b*) — stored for reference */
+static const double dp_bs[7] = {
+    5179.0/57600.0, 0.0, 7571.0/16695.0, 393.0/640.0,
+    -92097.0/339200.0, 187.0/2100.0, 1.0/40.0
+};
+
+/* Error coefficients: e = b - b* */
+static const double dp_e[7] = {
+    35.0/384.0     - 5179.0/57600.0,
+    0.0,
+    500.0/1113.0   - 7571.0/16695.0,
+    125.0/192.0    - 393.0/640.0,
+    -2187.0/6784.0 + 92097.0/339200.0,
+    11.0/84.0      - 187.0/2100.0,
+    -1.0/40.0
+};
+
+ODEResult ode_solve(ode_rhs_fn f, const double *y0, double t0, double t1,
+                    const double *params, int dim, double atol, double rtol,
+                    void *ctx) {
+    (void)dp_bs; /* stored for reference; dp_e encodes b-b* */
+
+    double **k = (double **)xmalloc(7 * sizeof(double *));
+    for (int i = 0; i < 7; i++) k[i] = vec_alloc(dim);
+    double *y   = vec_alloc(dim);
+    double *y5  = vec_alloc(dim);
+    double *err = vec_alloc(dim);
+    double *stg = vec_alloc(dim);
+
+    ODEResult res;
+    res.y   = vec_alloc(dim);
+    res.nfe = 0;
+
+    vec_copy(y0, y, dim);
+    double t  = t0;
+    double h  = 0.01 * (t1 - t0);  /* sign encodes direction */
+    int k1_fresh = 0;
+
+    const double safety = 0.9;
+    const int max_steps = 1000000;
+
+    for (int step = 0; step < max_steps; step++) {
+        /* Check termination */
+        if (t1 > t0) {
+            if (t >= t1) break;
+            if (t + h > t1) h = t1 - t;
+        } else {
+            if (t <= t1) break;
+            if (t + h < t1) h = t1 - t;
+        }
+
+        /* Stage 1 (skip on FSAL reuse) */
+        if (!k1_fresh) {
+            f(y, t, params, dim, k[0], ctx);
+            res.nfe++;
+            k1_fresh = 1;
+        }
+
+        /* Stage 2 */
+        for (int i = 0; i < dim; i++)
+            stg[i] = y[i] + h * (dp_a2[0]*k[0][i]);
+        f(stg, t + dp_c[1]*h, params, dim, k[1], ctx);
+        res.nfe++;
+
+        /* Stage 3 */
+        for (int i = 0; i < dim; i++)
+            stg[i] = y[i] + h * (dp_a3[0]*k[0][i] + dp_a3[1]*k[1][i]);
+        f(stg, t + dp_c[2]*h, params, dim, k[2], ctx);
+        res.nfe++;
+
+        /* Stage 4 */
+        for (int i = 0; i < dim; i++)
+            stg[i] = y[i] + h * (dp_a4[0]*k[0][i] + dp_a4[1]*k[1][i]
+                                + dp_a4[2]*k[2][i]);
+        f(stg, t + dp_c[3]*h, params, dim, k[3], ctx);
+        res.nfe++;
+
+        /* Stage 5 */
+        for (int i = 0; i < dim; i++)
+            stg[i] = y[i] + h * (dp_a5[0]*k[0][i] + dp_a5[1]*k[1][i]
+                                + dp_a5[2]*k[2][i] + dp_a5[3]*k[3][i]);
+        f(stg, t + dp_c[4]*h, params, dim, k[4], ctx);
+        res.nfe++;
+
+        /* Stage 6 */
+        for (int i = 0; i < dim; i++)
+            stg[i] = y[i] + h * (dp_a6[0]*k[0][i] + dp_a6[1]*k[1][i]
+                                + dp_a6[2]*k[2][i] + dp_a6[3]*k[3][i]
+                                + dp_a6[4]*k[4][i]);
+        f(stg, t + dp_c[5]*h, params, dim, k[5], ctx);
+        res.nfe++;
+
+        /* 5th-order solution y5 (b2=0, b7=0) */
+        for (int i = 0; i < dim; i++)
+            y5[i] = y[i] + h * (dp_b[0]*k[0][i] + dp_b[2]*k[2][i]
+                               + dp_b[3]*k[3][i] + dp_b[4]*k[4][i]
+                               + dp_b[5]*k[5][i]);
+
+        /* Stage 7 / FSAL: f at (t+h, y5) */
+        f(y5, t + h, params, dim, k[6], ctx);
+        res.nfe++;
+
+        /* Error estimate: e2=0, k[1] not used */
+        for (int i = 0; i < dim; i++)
+            err[i] = h * (dp_e[0]*k[0][i] + dp_e[2]*k[2][i]
+                        + dp_e[3]*k[3][i] + dp_e[4]*k[4][i]
+                        + dp_e[5]*k[5][i] + dp_e[6]*k[6][i]);
+
+        /* RMS error norm with mixed tolerance scaling */
+        double err_sq = 0.0;
+        for (int i = 0; i < dim; i++) {
+            double sc = atol + rtol * fmax(fabs(y[i]), fabs(y5[i]));
+            double e  = err[i] / sc;
+            err_sq   += e * e;
+        }
+        double err_norm = sqrt(err_sq / (double)dim);
+
+        /* Compute new step size factor */
+        double factor;
+        if (err_norm == 0.0) {
+            factor = 5.0;
+        } else {
+            factor = safety * pow(err_norm, -0.2);
+            if (factor < 0.2) factor = 0.2;
+            if (factor > 5.0) factor = 5.0;
+        }
+
+        if (err_norm <= 1.0) {
+            /* Accept: advance state, FSAL swap k[0] <-> k[6] */
+            vec_copy(y5, y, dim);
+            t += h;
+            double *tmp = k[0]; k[0] = k[6]; k[6] = tmp;
+            h *= factor;
+        } else {
+            /* Reject: shrink only */
+            if (factor > 1.0) factor = 1.0;
+            h *= factor;
+            /* k1_fresh stays 1 — y and t unchanged */
+        }
+    }
+
+    vec_copy(y, res.y, dim);
+
+    for (int i = 0; i < 7; i++) free(k[i]);
+    free(k);
+    free(y);
+    free(y5);
+    free(err);
+    free(stg);
+
+    return res;
+}
+
+/* Solve and record state at each time in times[0..ntimes-1].
+   times[0] is the start; result->y is dim*ntimes doubles. */
+ODEResult ode_solve_times(ode_rhs_fn f, const double *y0, const double *times,
+                          int ntimes, const double *params, int dim,
+                          double atol, double rtol, void *ctx) {
+    ODEResult res;
+    res.y   = vec_alloc(dim * ntimes);
+    res.nfe = 0;
+
+    vec_copy(y0, res.y, dim);  /* state at times[0] */
+
+    for (int i = 1; i < ntimes; i++) {
+        const double *cur = res.y + (i - 1) * dim;
+        ODEResult seg = ode_solve(f, cur, times[i-1], times[i],
+                                  params, dim, atol, rtol, ctx);
+        vec_copy(seg.y, res.y + i * dim, dim);
+        res.nfe += seg.nfe;
+        free(seg.y);
+    }
+
+    return res;
+}
+
+/* --- ODE solver tests --- */
+
+static void rhs_decay(const double *state, double t, const double *params,
+                      int dim, double *out, void *ctx) {
+    (void)t; (void)params; (void)dim; (void)ctx;
+    out[0] = -state[0];
+}
+
+static void rhs_rotation(const double *state, double t, const double *params,
+                         int dim, double *out, void *ctx) {
+    (void)t; (void)params; (void)dim; (void)ctx;
+    out[0] = -state[1];
+    out[1] =  state[0];
+}
+
+static void test_ode_solver(void) {
+    const double atol = 1e-8, rtol = 1e-8;
+    const double check_tol = 1e-6;
+
+    /* Test 1: scalar decay dy/dt = -y, y(0)=1 -> y(1) = e^{-1} */
+    {
+        double y0 = 1.0;
+        ODEResult r = ode_solve(rhs_decay, &y0, 0.0, 1.0, NULL, 1, atol, rtol, NULL);
+        double exact = exp(-1.0);
+        double err   = fabs(r.y[0] - exact);
+        printf("ODE test 1 (decay):    err=%.2e  nfe=%d  %s\n",
+               err, r.nfe, err < check_tol ? "PASS" : "FAIL");
+        free(r.y);
+    }
+
+    /* Test 2: 2D rotation, one full period -> back to [1, 0] */
+    {
+        double y0[2] = {1.0, 0.0};
+        ODEResult r = ode_solve(rhs_rotation, y0, 0.0, 2.0 * M_PI,
+                                NULL, 2, atol, rtol, NULL);
+        double err = sqrt((r.y[0]-1.0)*(r.y[0]-1.0) + r.y[1]*r.y[1]);
+        printf("ODE test 2 (rotation): err=%.2e  nfe=%d  %s\n",
+               err, r.nfe, err < check_tol ? "PASS" : "FAIL");
+        free(r.y);
+    }
+
+    /* Test 3: backward integration, decay from t=1 to t=0 */
+    {
+        double y0 = exp(-1.0);
+        ODEResult r = ode_solve(rhs_decay, &y0, 1.0, 0.0, NULL, 1, atol, rtol, NULL);
+        double err = fabs(r.y[0] - 1.0);
+        printf("ODE test 3 (backward): err=%.2e  nfe=%d  %s\n",
+               err, r.nfe, err < check_tol ? "PASS" : "FAIL");
+        free(r.y);
+    }
+}
 
 static void test_dynmlp_gradients(RNG *r) {
     const int D = 3;
@@ -360,8 +613,11 @@ static void test_dynmlp_gradients(RNG *r) {
     free(num_vjp_theta);
 }
 
+
+
 int main(void) {
     RNG r = rng_init(42);
     test_dynmlp_gradients(&r);
+    test_ode_solver();
     return 0;
 }
