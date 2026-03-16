@@ -135,3 +135,53 @@ static void xavier_init(double *w, int fan_in, int fan_out, RNG *r) {
 static void bias_init(double *b, int n) {
     vec_zero(b, n);
 }
+
+
+static void act_tanh(const double *x, double *dst, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = tanh(x[i]);
+}
+
+static void act_dtanh(const double *y, double *dst, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = 1.0 - y[i] * y[i];
+}
+
+
+/* --- DynMLP: f(z, t, θ): R^(D+1) -> R^D via tanh hidden layer --- */
+
+typedef struct {
+    int D;       /* state dimension  */
+    int H;       /* hidden dimension */
+    int nparams; /* total number of parameters */
+} DynMLP;
+
+#define DYNMLP_W1(D, H)  (0)
+#define DYNMLP_b1(D, H)  ((D + 1) * (H))
+#define DYNMLP_W2(D, H)  ((D + 1) * (H) + (H))
+#define DYNMLP_b2(D, H)  ((D + 1) * (H) + (H) + (H) * (D))
+
+static int dynmlp_nparams(int D, int H) {
+    return (D + 1) * H   /* W1 */
+         + H             /* b1 */
+         + H * D         /* W2 */
+         + D;            /* b2 */
+}
+
+static void dynmlp_init(DynMLP *net, int D, int H, double *theta, RNG *r) {
+    net->D       = D;
+    net->H       = H;
+    net->nparams = dynmlp_nparams(D, H);
+
+    double *W1 = theta + DYNMLP_W1(D, H);
+    double *b1 = theta + DYNMLP_b1(D, H);
+    double *W2 = theta + DYNMLP_W2(D, H);
+    double *b2 = theta + DYNMLP_b2(D, H);
+
+    xavier_init(W1, D + 1, H, r);
+    bias_init(b1, H);
+    xavier_init(W2, H, D, r);
+    bias_init(b2, D);
+}
+
+
