@@ -217,4 +217,151 @@ static void dynmlp_forward(const DynMLP *net, const double *theta,
     free(h);
 }
 
+static void dynmlp_vjp(const DynMLP *net, const double *theta,
+                       const double *z, double t, const double *v,
+                       double *vjp_z, double *vjp_theta) {
+    int D = net->D, H = net->H;
+    const double *W1 = theta + DYNMLP_W1(D, H);
+    const double *b1 = theta + DYNMLP_b1(D, H);
+    const double *W2 = theta + DYNMLP_W2(D, H);
 
+    double *dW1 = vjp_theta + DYNMLP_W1(D, H);
+    double *db1 = vjp_theta + DYNMLP_b1(D, H);
+    double *dW2 = vjp_theta + DYNMLP_W2(D, H);
+    double *db2 = vjp_theta + DYNMLP_b2(D, H);
+
+    /* --- recover intermediates --- */
+    double *x     = vec_alloc(D + 1);
+    double *h_pre = vec_alloc(H);
+    double *h     = vec_alloc(H);
+
+    vec_copy(z, x, D);
+    x[D] = t;
+    mat_vec(W1, x, h_pre, H, D + 1);
+    vec_add_scaled(h_pre, 1.0, b1, H);
+    act_tanh(h_pre, h, H);
+
+    /* --- backward --- */
+    double *dh     = vec_zeros(H);
+    double *dh_pre = vec_alloc(H);
+    double *dx     = vec_zeros(D + 1);
+
+    mat_vec_T(W2, v, dh, D, H);      /* W2: D×H */
+
+    /* dW2 += outer(v, h), db2 += v */
+    mat_outer_add(dW2, 1.0, v, h, D, H);
+    vec_add_scaled(db2, 1.0, v, D);
+
+    /* dh_pre = dh * (1 - h*h) element-wise */
+    act_dtanh(h, dh_pre, H);
+    for (int i = 0; i < H; i++)
+        dh_pre[i] *= dh[i];
+
+    /* dx = W1^T * dh_pre */
+    mat_vec_T(W1, dh_pre, dx, H, D + 1);  /* W1: H×(D+1) */
+
+    /* dW1 += outer(dh_pre, x), db1 += dh_pre */
+    mat_outer_add(dW1, 1.0, dh_pre, x, H, D + 1);
+    vec_add_scaled(db1, 1.0, dh_pre, H);
+
+    /* vjp_z = dx[0..D-1] */
+    vec_copy(dx, vjp_z, D);
+
+    free(x);
+    free(h_pre);
+    free(h);
+    free(dh);
+    free(dh_pre);
+    free(dx);
+}
+
+
+static void test_dynmlp_gradients(RNG *r) {
+    const int D = 3;
+    const int H = 8;
+    const double EPS = 1e-7;
+    const double TOL = 1e-5;
+
+    int np = dynmlp_nparams(D, H);
+    double *theta  = vec_alloc(np);
+    double *z      = vec_alloc(D);
+    double *v      = vec_alloc(D);
+    double *out_p  = vec_alloc(D);
+    double *out_m  = vec_alloc(D);
+
+    DynMLP net;
+    dynmlp_init(&net, D, H, theta, r);
+    for (int i = 0; i < D;  i++) z[i] = rng_normal(r);
+    for (int i = 0; i < D;  i++) v[i] = rng_normal(r);
+    double t = rng_normal(r);
+
+    /* --- analytical VJP --- */
+    double *vjp_z     = vec_zeros(D);
+    double *vjp_theta = vec_zeros(np);
+    dynmlp_vjp(&net, theta, z, t, v, vjp_z, vjp_theta);
+
+    /* --- numerical VJP w.r.t. z --- */
+    double *num_vjp_z = vec_alloc(D);
+    for (int i = 0; i < D; i++) {
+        double zi = z[i];
+
+        z[i] = zi + EPS;
+        dynmlp_forward(&net, theta, z, t, out_p);
+
+        z[i] = zi - EPS;
+        dynmlp_forward(&net, theta, z, t, out_m);
+
+        z[i] = zi;
+        num_vjp_z[i] = vec_dot(v, out_p, D) - vec_dot(v, out_m, D);
+        num_vjp_z[i] /= 2.0 * EPS;
+    }
+
+    double max_err_z = 0.0;
+    for (int i = 0; i < D; i++) {
+        double e = fabs(vjp_z[i] - num_vjp_z[i]);
+        if (e > max_err_z) max_err_z = e;
+    }
+
+    /* --- numerical VJP w.r.t. theta --- */
+    double *num_vjp_theta = vec_alloc(np);
+    for (int k = 0; k < np; k++) {
+        double tk = theta[k];
+
+        theta[k] = tk + EPS;
+        dynmlp_forward(&net, theta, z, t, out_p);
+
+        theta[k] = tk - EPS;
+        dynmlp_forward(&net, theta, z, t, out_m);
+
+        theta[k] = tk;
+        num_vjp_theta[k] = vec_dot(v, out_p, D) - vec_dot(v, out_m, D);
+        num_vjp_theta[k] /= 2.0 * EPS;
+    }
+
+    double max_err_theta = 0.0;
+    for (int k = 0; k < np; k++) {
+        double e = fabs(vjp_theta[k] - num_vjp_theta[k]);
+        if (e > max_err_theta) max_err_theta = e;
+    }
+
+    printf("max grad error z: %.2e %s\n",
+           max_err_z, max_err_z < TOL ? "PASS":"FAIL");
+    printf("max grad error theta: %.2e %s\n",
+           max_err_theta, max_err_theta < TOL ? "PASS" : "FAIL");
+
+    free(theta); 
+    free(z); 
+    free(v);
+    free(out_p);
+    free(out_m);
+    free(vjp_z);
+    free(vjp_theta);
+    free(num_vjp_z);
+    free(num_vjp_theta);
+}
+
+int main(void) {
+    RNG r = rng_init(42);
+    test_dynmlp_gradients(&r);
+    return 0;
+}
