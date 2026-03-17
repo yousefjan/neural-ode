@@ -392,33 +392,91 @@ typedef struct {
     int nfe;
 } AdjointResult;
 
-AdjointResult adjoint_solve(const DynMLP *net, const double *theta,
-                            const double *z0, double t0, double t1,
-                            const double *z1, const double *dL_dz1,
-                            double atol, double rtol) {
-    (void)z0; 
+typedef struct {
+    int     num_checkpoints;  
+    double *times;  /* times[0..num_checkpoints], length num_checkpoints+1 */
+    double **states;  /* states[0..num_checkpoints], state at each checkpoint time */
+    double *z1;  /* separate copy of states[num_checkpoints] = z(t1) */
+    int     nfe;
+} ForwardResult;
+
+static void forward_result_free(ForwardResult *fr) {
+    free(fr->times);
+    for (int i = 0; i <= fr->num_checkpoints; i++)
+        free(fr->states[i]);
+    free(fr->states);
+    free(fr->z1);
+}
+
+static ForwardResult forward_solve(const DynMLP *net, const double *theta,
+                                   const double *z0, double t0, double t1,
+                                   double atol, double rtol, int num_checkpoints) {
+    int D = net->D;
+    AdjointCtx ac = { *net, theta, D, net->nparams };
+
+    ForwardResult fr;
+    fr.num_checkpoints = num_checkpoints;
+    fr.nfe = 0;
+
+    fr.times  = vec_alloc(num_checkpoints + 1);
+    fr.states = (double **)xmalloc((size_t)(num_checkpoints + 1) * sizeof(double *));
+    for (int i = 0; i <= num_checkpoints; i++)
+        fr.states[i] = vec_alloc(D);
+
+    for (int i = 0; i <= num_checkpoints; i++)
+        fr.times[i] = t0 + (t1 - t0) * (double)i / (double)num_checkpoints;
+
+    vec_copy(z0, fr.states[0], D);
+
+    for (int i = 0; i < num_checkpoints; i++) {
+        ODEResult seg = ode_solve(neural_ode_rhs, fr.states[i],
+                                  fr.times[i], fr.times[i + 1],
+                                  NULL, D, atol, rtol, &ac);
+        vec_copy(seg.y, fr.states[i + 1], D);
+        fr.nfe += seg.nfe;
+        free(seg.y);
+    }
+
+    fr.z1 = vec_alloc(D);
+    vec_copy(fr.states[num_checkpoints], fr.z1, D);
+
+    return fr;
+}
+
+static AdjointResult adjoint_solve(const DynMLP *net, const double *theta,
+                                   const ForwardResult *fr, const double *dL_dz1,
+                                   double atol, double rtol) {
     int D = net->D;
     int nparams = net->nparams;
     int aug_dim = 2 * D + nparams;
 
-    double *aug0 = vec_zeros(aug_dim);
-    vec_copy(z1, aug0, D);
-    vec_copy(dL_dz1, aug0 + D, D);
+    double *aug = vec_zeros(aug_dim);
+    vec_copy(fr->z1, aug, D);
+    vec_copy(dL_dz1, aug + D, D);
 
     AdjointCtx ac = { *net, theta, D, nparams };
-    ODEResult res = ode_solve(adjoint_dynamics, aug0, t1, t0,
-                              NULL, aug_dim, atol, rtol, &ac);
+    int total_nfe = 0;
+
+    for (int k = fr->num_checkpoints; k >= 1; k--) {
+        /* Replace z with stored checkpoint to prevent numerical drift */
+        vec_copy(fr->states[k], aug, D);
+
+        ODEResult seg = ode_solve(adjoint_dynamics, aug,
+                                  fr->times[k], fr->times[k - 1],
+                                  NULL, aug_dim, atol, rtol, &ac);
+        vec_copy(seg.y, aug, aug_dim);
+        total_nfe += seg.nfe;
+        free(seg.y);
+    }
 
     AdjointResult ar;
-    ar.dL_dz0 = vec_alloc(D);
+    ar.dL_dz0    = vec_alloc(D);
     ar.dL_dtheta = vec_alloc(nparams);
-    ar.nfe = res.nfe;
-    vec_copy(res.y + D, ar.dL_dz0, D);
-    vec_copy(res.y + 2 * D, ar.dL_dtheta, nparams);
+    ar.nfe       = total_nfe;
+    vec_copy(aug + D, ar.dL_dz0, D);
+    vec_copy(aug + 2 * D, ar.dL_dtheta, nparams);
 
-    free(res.y);
-    free(aug0);
-    
+    free(aug);
     return ar;
 }
 
@@ -432,23 +490,26 @@ typedef struct {
 
 NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *theta,
                                             const double *z0, double t0, double t1,
-                                            const double *target, double atol, double rtol) {
+                                            const double *target, double atol, double rtol,
+                                            int num_checkpoints) {
     int D = net->D;
-    AdjointCtx ac = { *net, theta, D, net->nparams };
-    ODEResult fwd = ode_solve(neural_ode_rhs, z0, t0, t1, NULL, D, atol, rtol, &ac);
+
+    ForwardResult fr = forward_solve(net, theta, z0, t0, t1, atol, rtol, num_checkpoints);
+
     double *dL_dz1 = vec_alloc(D);
+    for (int i = 0; i < D; i++) dL_dz1[i] = fr.z1[i] - target[i];
 
-    for (int i = 0; i < D; i++) dL_dz1[i] = fwd.y[i] - target[i]; 
-
-    AdjointResult ar = adjoint_solve(net, theta, z0, t0, t1, fwd.y, dL_dz1, atol, rtol);
+    AdjointResult ar = adjoint_solve(net, theta, &fr, dL_dz1, atol, rtol);
 
     NeuralODEOutput out;
-    out.z1 = fwd.y; 
-    out.dL_dz0 = ar.dL_dz0;
-    out.dL_dtheta = ar.dL_dtheta;
-    out.nfe_forward = fwd.nfe;
+    out.z1           = vec_alloc(D);
+    vec_copy(fr.z1, out.z1, D);
+    out.dL_dz0       = ar.dL_dz0;
+    out.dL_dtheta    = ar.dL_dtheta;
+    out.nfe_forward  = fr.nfe;
     out.nfe_backward = ar.nfe;
 
+    forward_result_free(&fr);
     free(dL_dz1);
     return out;
 }
@@ -502,10 +563,10 @@ static void adam_free(Adam *a) {
 static double train_one(const DynMLP *net, const double *theta,
                         const double *z0, double t0, double t1,
                         const double *target, double *grad_accum,
-                        double atol, double rtol,
+                        double atol, double rtol, int num_checkpoints,
                         int *nfe_fwd, int *nfe_bwd) {
     NeuralODEOutput out = neural_ode_forward_backward(net, theta, z0, t0, t1,
-                                                      target, atol, rtol);
+                                                      target, atol, rtol, num_checkpoints);
     double loss = 0.0;
     int D = net->D;
     for (int i = 0; i < D; i++) {
@@ -530,14 +591,15 @@ typedef struct {
 static TrainStepResult train_step(const DynMLP *net, double *theta,
                                   const double **z0s, const double **targets,
                                   double t0, double t1, int batch_size,
-                                  Adam *adam, double atol, double rtol) {
+                                  Adam *adam, double atol, double rtol, int num_checkpoints) {
     int nparams = net->nparams;
     double *grad_accum = vec_zeros(nparams);
     TrainStepResult res = { 0.0, 0, 0 };
 
     for (int b = 0; b < batch_size; b++) {
         res.loss += train_one(net, theta, z0s[b], t0, t1, targets[b],
-                              grad_accum, atol, rtol, &res.nfe_fwd, &res.nfe_bwd);
+                              grad_accum, atol, rtol, num_checkpoints,
+                              &res.nfe_fwd, &res.nfe_bwd);
     }
     res.loss /= (double)batch_size;
     for (int i = 0; i < nparams; i++) grad_accum[i] /= (double)batch_size;
@@ -729,7 +791,7 @@ static void test_adjoint_gradients(RNG *r) {
     for (int i = 0; i < D; i++) target[i] = rng_normal(r);
 
     NeuralODEOutput out = neural_ode_forward_backward(&net, theta, z0, t0, t1,
-                                                      target, atol, rtol);
+                                                      target, atol, rtol, 10);
 
 #define FWD_LOSS(z0_, theta_) ({ \
     AdjointCtx ac_ = { net, (theta_), D, np }; \
@@ -785,8 +847,6 @@ static void test_adjoint_gradients(RNG *r) {
     free(theta); free(z0); free(target);
 }
 
-
-
 static void test_training(RNG *r) {
     const int D = 2, H = 16;
     const int N = 50, BATCH = 10, ITERS = 300;
@@ -822,7 +882,7 @@ static void test_training(RNG *r) {
             batch_tgt[b] = targets[idx];
         }
         TrainStepResult res = train_step(&net, theta, batch_z0, batch_tgt,
-                                         t0, t1, BATCH, &adam, atol, rtol);
+                                         t0, t1, BATCH, &adam, atol, rtol, 10);
         if ((iter + 1) % 50 == 0)
             printf("iter %3d  loss=%.4f  nfe_fwd=%d\n", iter + 1, res.loss, res.nfe_fwd);
     }
@@ -894,7 +954,7 @@ int main(void) {
 
         TrainStepResult res = train_step(&net, theta, batch_z0, batch_tgt,
                                          t0, t1, BATCH, &adam,
-                                         atol_train, rtol_train);
+                                         atol_train, rtol_train, 10);
 
         if (iter % LOG_EVERY == 0) {
             double test_loss = evaluate(&net, theta, &test_ds,
