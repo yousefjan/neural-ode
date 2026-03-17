@@ -515,19 +515,124 @@ NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *the
 }
 
 /* ============================================================
+   § Multi-observation adjoint
+   ============================================================ */
+
+typedef struct {
+    double *dL_dz0;  
+    double *dL_dtheta; 
+    int nfe;   
+} MultiObsAdjointResult;
+
+/* adjoint_solve_multi: backward pass with `kicks' at each observation time.
+   z_traj[i*D .. i*D+D] = z(times[i]) from the forward pass.
+   dL_dz_each[i*D .. i*D+D] = dL_i/dz(times[i]) for each observation. */
+static MultiObsAdjointResult adjoint_solve_multi(
+    const DynMLP *net,
+    const double *theta,
+    const double *z_traj,
+    const double *times,
+    const double *dL_dz_each,
+    int ntimes,
+    double atol,
+    double rtol)
+{
+    int D       = net->D;
+    int nparams = net->nparams;
+    int aug_dim = 2 * D + nparams;
+
+    AdjointCtx ac = { *net, theta, D, nparams };
+
+    double *a = vec_alloc(D);
+    double *dtheta = vec_zeros(nparams);
+    double *aug = vec_alloc(aug_dim);
+    int total_nfe = 0;
+
+    vec_copy(dL_dz_each + (ntimes - 1) * D, a, D);
+
+    for (int i = ntimes - 1; i >= 1; i--) {
+        vec_copy(z_traj + i * D, aug, D);
+        vec_copy(a,      aug + D,      D);
+        vec_copy(dtheta, aug + 2 * D,  nparams);
+
+        ODEResult seg = ode_solve(adjoint_dynamics, aug,
+                                  times[i], times[i - 1],
+                                  NULL, aug_dim, atol, rtol, &ac);
+        vec_copy(seg.y, aug, aug_dim);
+        total_nfe += seg.nfe;
+        free(seg.y);
+
+        vec_copy(aug + D, a, D);
+        vec_copy(aug + 2 * D, dtheta, nparams);
+
+        /* Kick: add per-observation loss gradient at time t_{i-1} */
+        vec_add_scaled(a, 1.0, dL_dz_each + (i - 1) * D, D);
+    }
+
+    MultiObsAdjointResult result;
+    result.dL_dz0    = a;
+    result.dL_dtheta = dtheta;
+    result.nfe       = total_nfe;
+
+    free(aug);
+    return result;
+}
+
+typedef struct {
+    double *z_traj; 
+    double *dL_dz0;
+    double *dL_dtheta;
+    int nfe_forward;
+    int nfe_backward;
+} MultiObsNeuralODEOutput;
+
+MultiObsNeuralODEOutput neural_ode_forward_backward_multi(
+    const DynMLP *net,
+    const double *theta,
+    const double *z0,
+    const double *times,
+    const double *targets,
+    int ntimes,
+    double atol,
+    double rtol)
+{
+    int D = net->D;
+    AdjointCtx ac = { *net, theta, D, net->nparams };
+
+    ODEResult fwd = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
+                                    NULL, D, atol, rtol, &ac);
+
+    double *dL_dz_each = vec_alloc(ntimes * D);
+    for (int i = 0; i < ntimes * D; i++)
+        dL_dz_each[i] = fwd.y[i] - targets[i];
+
+    MultiObsAdjointResult ar = adjoint_solve_multi(net, theta, fwd.y, times,
+                                                   dL_dz_each, ntimes, atol, rtol);
+    free(dL_dz_each);
+
+    MultiObsNeuralODEOutput out;
+    out.z_traj       = fwd.y;   
+    out.dL_dz0       = ar.dL_dz0;
+    out.dL_dtheta    = ar.dL_dtheta;
+    out.nfe_forward  = fwd.nfe;
+    out.nfe_backward = ar.nfe;
+    return out;
+}
+
+/* ============================================================
    § Training loop
    ============================================================ */
 
 
 typedef struct {
-    double *m;       /* first moment */
-    double *v;       /* second moment */
-    int     nparams;
-    double  lr;
-    double  beta1;
-    double  beta2;
-    double  eps;
-    int     t;       /* step count */
+    double *m;   
+    double *v;   
+    int nparams;
+    double lr;
+    double beta1;
+    double beta2;
+    double eps;
+    int t;   
 } Adam;
 
 static Adam adam_init(int nparams, double lr, double beta1, double beta2, double eps) {
@@ -847,6 +952,111 @@ static void test_adjoint_gradients(RNG *r) {
     free(theta); free(z0); free(target);
 }
 
+static void test_multi_obs_adjoint(RNG *r) {
+    const int D = 2, H = 8;
+    const double EPS = 1e-5, atol = 1e-7, rtol = 1e-7;
+    const int ntimes = 5;
+
+    double times[5] = { 0.0, 0.5, 1.0, 1.5, 2.0 };
+
+    int np = dynmlp_nparams(D, H);
+    double *theta = vec_alloc(np);
+    double *z0 = vec_alloc(D);
+    double *targets = vec_alloc(ntimes * D);
+
+    DynMLP net;
+    dynmlp_init(&net, D, H, theta, r);
+    for (int i = 0; i < D; i++) z0[i] = rng_normal(r);
+    for (int i = 0; i < ntimes * D; i++) targets[i] = rng_normal(r);
+
+    MultiObsNeuralODEOutput out = neural_ode_forward_backward_multi(
+        &net, theta, z0, times, targets, ntimes, atol, rtol);
+
+    AdjointCtx ac = { net, theta, D, np };
+
+    /* Numerical dL/dtheta */
+    double *num_dL_dtheta = vec_alloc(np);
+    for (int k = 0; k < np; k++) {
+        double tk = theta[k];
+
+        theta[k] = tk + EPS;
+        ODEResult rp = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
+                                       NULL, D, atol, rtol, &ac);
+        double lp = 0.0;
+        for (int i = 0; i < ntimes * D; i++) {
+            double d = rp.y[i] - targets[i]; lp += 0.5 * d * d;
+        }
+        free(rp.y);
+
+        theta[k] = tk - EPS;
+        ODEResult rm = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
+                                       NULL, D, atol, rtol, &ac);
+        double lm = 0.0;
+        for (int i = 0; i < ntimes * D; i++) {
+            double d = rm.y[i] - targets[i]; lm += 0.5 * d * d;
+        }
+        free(rm.y);
+
+        theta[k] = tk;
+        num_dL_dtheta[k] = (lp - lm) / (2.0 * EPS);
+    }
+
+    double max_num_theta = 0.0;
+    for (int k = 0; k < np; k++)
+        if (fabs(num_dL_dtheta[k]) > max_num_theta) max_num_theta = fabs(num_dL_dtheta[k]);
+    double max_err_theta = 0.0;
+    for (int k = 0; k < np; k++) {
+        double e = fabs(out.dL_dtheta[k] - num_dL_dtheta[k]);
+        if (e > max_err_theta) max_err_theta = e;
+    }
+    double rel_theta = max_err_theta / (max_num_theta + 1e-8);
+    printf("multi-obs adjoint dL/dtheta: max_rel_err=%.2e  nfe_fwd=%d  nfe_bwd=%d  %s\n",
+           rel_theta, out.nfe_forward, out.nfe_backward, rel_theta < 1e-3 ? "PASS" : "FAIL");
+
+    /* Numerical dL/dz0 */
+    double *num_dL_dz0 = vec_alloc(D);
+    for (int i = 0; i < D; i++) {
+        double zi = z0[i];
+
+        z0[i] = zi + EPS;
+        ODEResult rp = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
+                                       NULL, D, atol, rtol, &ac);
+        double lp = 0.0;
+        for (int j = 0; j < ntimes * D; j++) {
+            double d = rp.y[j] - targets[j]; lp += 0.5 * d * d;
+        }
+        free(rp.y);
+
+        z0[i] = zi - EPS;
+        ODEResult rm = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
+                                       NULL, D, atol, rtol, &ac);
+        double lm = 0.0;
+        for (int j = 0; j < ntimes * D; j++) {
+            double d = rm.y[j] - targets[j]; lm += 0.5 * d * d;
+        }
+        free(rm.y);
+
+        z0[i] = zi;
+        num_dL_dz0[i] = (lp - lm) / (2.0 * EPS);
+    }
+
+    double max_num_z0 = 0.0;
+    for (int i = 0; i < D; i++)
+        if (fabs(num_dL_dz0[i]) > max_num_z0) max_num_z0 = fabs(num_dL_dz0[i]);
+    double max_err_z0 = 0.0;
+    for (int i = 0; i < D; i++) {
+        double e = fabs(out.dL_dz0[i] - num_dL_dz0[i]);
+        if (e > max_err_z0) max_err_z0 = e;
+    }
+    double rel_z0 = max_err_z0 / (max_num_z0 + 1e-8);
+    printf("multi-obs adjoint dL/dz0:    max_rel_err=%.2e  %s\n",
+           rel_z0, rel_z0 < 1e-3 ? "PASS" : "FAIL");
+
+    free(out.z_traj); free(out.dL_dz0); free(out.dL_dtheta);
+    free(num_dL_dtheta); free(num_dL_dz0);
+    free(theta); free(z0); free(targets);
+}
+
 static void test_training(RNG *r) {
     const int D = 2, H = 16;
     const int N = 50, BATCH = 10, ITERS = 300;
@@ -859,14 +1069,14 @@ static void test_training(RNG *r) {
     dynmlp_init(&net, D, H, theta, r);
     Adam adam = adam_init(nparams, 1e-3, 0.9, 0.999, 1e-8);
 
-    double **z0s     = (double **)xmalloc(N * sizeof(double *));
+    double **z0s = (double **)xmalloc(N * sizeof(double *));
     double **targets = (double **)xmalloc(N * sizeof(double *));
     for (int i = 0; i < N; i++) {
         double angle = 2.0 * M_PI * rng_uniform(r);
-        z0s[i]     = vec_alloc(D);
+        z0s[i] = vec_alloc(D);
         targets[i] = vec_alloc(D);
-        z0s[i][0]  =  cos(angle);
-        z0s[i][1]  =  sin(angle);
+        z0s[i][0] = cos(angle);
+        z0s[i][1] = sin(angle);
         targets[i][0] = -z0s[i][1];
         targets[i][1] =  z0s[i][0];
     }
@@ -907,6 +1117,8 @@ static void test_training(RNG *r) {
     free(theta);
 }
 
+
+
 int main(void) {
     RNG r = rng_init(42);
 
@@ -914,6 +1126,7 @@ int main(void) {
     test_ode_solver();
     test_dynmlp_gradients(&r);
     test_adjoint_gradients(&r);
+    test_multi_obs_adjoint(&r);
     test_training(&r);
 
     printf("\n--- Training demo (spiral) ---\n\n");
