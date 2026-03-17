@@ -152,7 +152,8 @@ static void dynmlp_forward(const DynMLP *net, const double *theta,
 static void dynmlp_vjp(const DynMLP *net, const double *theta,
                        const double *z, double t, const double *v,
                        double *vjp_z, double *vjp_theta) {
-    int D = net->D, H = net->H;
+    int D = net->D;
+    int H = net->H;
     const double *W1 = theta + DYNMLP_W1(D, H);
     const double *b1 = theta + DYNMLP_b1(D, H);
     const double *W2 = theta + DYNMLP_W2(D, H);
@@ -168,7 +169,9 @@ static void dynmlp_vjp(const DynMLP *net, const double *theta,
     x[D] = t;
     mat_vec(W1, x, h_pre, H, D + 1);
     vec_add_scaled(h_pre, 1.0, b1, H);
-    for (int i = 0; i < H; i++) h[i] = tanh(h_pre[i]);
+    
+    for (int i = 0; i < H; i++)
+      h[i] = tanh(h_pre[i]);
 
     double *dh     = vec_zeros(H);
     double *dh_pre = vec_alloc(H);
@@ -178,7 +181,8 @@ static void dynmlp_vjp(const DynMLP *net, const double *theta,
     mat_outer_add(dW2, 1.0, v, h, D, H);
     vec_add_scaled(db2, 1.0, v, D);
 
-    for (int i = 0; i < H; i++) dh_pre[i] = (1.0 - h[i] * h[i]) * dh[i];
+    for (int i = 0; i < H; i++) 
+      dh_pre[i] = (1.0 - h[i] * h[i]) * dh[i];
 
     mat_vec_T(W1, dh_pre, dx, H, D + 1);
     mat_outer_add(dW1, 1.0, dh_pre, x, H, D + 1);
@@ -198,7 +202,7 @@ typedef void (*ode_rhs_fn)(const double *state, double t, const double *params,
 
 typedef struct {
     double *y;
-    int nfe;
+    int nfe; // number of fn evaluations
 } ODEResult;
 
 static const double dp_c[7]  = { 0.0, 1.0/5.0, 3.0/10.0, 4.0/5.0, 8.0/9.0, 1.0, 1.0 };
@@ -306,8 +310,14 @@ ODEResult ode_solve(ode_rhs_fn f, const double *y0, double t0, double t1,
     }
 
     vec_copy(y, res.y, dim);
-    for (int i = 0; i < 7; i++) free(k[i]);
-    free(k); free(y); free(y5); free(err); free(stg);
+    for (int i = 0; i < 7; i++)  free(k[i]);
+    
+    free(k);
+    free(y);
+    free(y5);
+    free(err);
+    free(stg);
+
     return res;
 }
 
@@ -321,6 +331,7 @@ ODEResult ode_solve_times(ode_rhs_fn f, const double *y0, const double *times,
                                   params, dim, atol, rtol, ctx);
         vec_copy(seg.y, res.y + i * dim, dim);
         res.nfe += seg.nfe;
+    
         free(seg.y);
     }
     return res;
@@ -339,14 +350,19 @@ typedef struct {
 
 static void neural_ode_rhs(const double *state, double t, const double *params,
                            int dim, double *out, void *ctx) {
-    (void)params; (void)dim;
+    (void)params; 
+    (void)dim;
+    
     AdjointCtx *ac = (AdjointCtx *)ctx;
+    
     dynmlp_forward(&ac->net, ac->theta, state, t, out);
 }
 
 static void adjoint_dynamics(const double *aug_state, double t, const double *params,
                              int aug_dim, double *aug_out, void *ctx) {
-    (void)params; (void)aug_dim;
+    (void)params; 
+    (void)aug_dim;
+    
     AdjointCtx *ac = (AdjointCtx *)ctx;
     int D = ac->state_dim;
     int nparams = ac->nparams;
@@ -400,7 +416,9 @@ AdjointResult adjoint_solve(const DynMLP *net, const double *theta,
     vec_copy(res.y + D, ar.dL_dz0, D);
     vec_copy(res.y + 2 * D, ar.dL_dtheta, nparams);
 
-    free(res.y); free(aug0);
+    free(res.y);
+    free(aug0);
+    
     return ar;
 }
 
@@ -420,8 +438,7 @@ NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *the
     ODEResult fwd = ode_solve(neural_ode_rhs, z0, t0, t1, NULL, D, atol, rtol, &ac);
     double *dL_dz1 = vec_alloc(D);
 
-    for (int i = 0; i < D; i++) 
-      dL_dz1[i] = fwd.y[i] - target[i]; 
+    for (int i = 0; i < D; i++) dL_dz1[i] = fwd.y[i] - target[i]; 
 
     AdjointResult ar = adjoint_solve(net, theta, z0, t0, t1, fwd.y, dL_dz1, atol, rtol);
 
@@ -434,6 +451,61 @@ NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *the
 
     free(dL_dz1);
     return out;
+}
+
+/* ============================================================
+   § Training loop
+   ============================================================ */
+
+static void sgd_update(double *theta, const double *grad, int nparams, double lr) {
+    for (int i = 0; i < nparams; i++) theta[i] -= lr * grad[i];
+}
+
+static double train_one(const DynMLP *net, const double *theta,
+                        const double *z0, double t0, double t1,
+                        const double *target, double *grad_accum,
+                        double atol, double rtol,
+                        int *nfe_fwd, int *nfe_bwd) {
+    NeuralODEOutput out = neural_ode_forward_backward(net, theta, z0, t0, t1,
+                                                      target, atol, rtol);
+    double loss = 0.0;
+    int D = net->D;
+    for (int i = 0; i < D; i++) {
+        double d = out.z1[i] - target[i];
+        loss += 0.5 * d * d;
+    }
+    for (int i = 0; i < net->nparams; i++) grad_accum[i] += out.dL_dtheta[i];
+    *nfe_fwd += out.nfe_forward;
+    *nfe_bwd += out.nfe_backward;
+    free(out.z1);
+    free(out.dL_dz0);
+    free(out.dL_dtheta);
+    return loss;
+}
+
+typedef struct {
+    double loss;
+    int nfe_fwd;
+    int nfe_bwd;
+} TrainStepResult;
+
+static TrainStepResult train_step(const DynMLP *net, double *theta,
+                                  const double **z0s, const double **targets,
+                                  double t0, double t1, int batch_size,
+                                  double lr, double atol, double rtol) {
+    int nparams = net->nparams;
+    double *grad_accum = vec_zeros(nparams);
+    TrainStepResult res = { 0.0, 0, 0 };
+
+    for (int b = 0; b < batch_size; b++) {
+        res.loss += train_one(net, theta, z0s[b], t0, t1, targets[b],
+                              grad_accum, atol, rtol, &res.nfe_fwd, &res.nfe_bwd);
+    }
+    res.loss /= (double)batch_size;
+    for (int i = 0; i < nparams; i++) grad_accum[i] /= (double)batch_size;
+    sgd_update(theta, grad_accum, nparams, lr);
+    free(grad_accum);
+    return res;
 }
 
 /* ============================================================
@@ -521,8 +593,8 @@ static void test_dynmlp_gradients(RNG *r) {
         if (e > max_err_theta) max_err_theta = e;
     }
 
-    printf("MLP vjp dL/dz:     max_err=%.2e  %s\n", max_err_z, max_err_z < TOL ? "PASS" : "FAIL");
-    printf("MLP vjp dL/dtheta: max_err=%.2e  %s\n", max_err_theta, max_err_theta < TOL ? "PASS" : "FAIL");
+    printf("dL/dz:     max_err=%.2e  %s\n", max_err_z, max_err_z < TOL ? "PASS" : "FAIL");
+    printf("dL/dtheta: max_err=%.2e  %s\n", max_err_theta, max_err_theta < TOL ? "PASS" : "FAIL");
 
     free(theta); free(z); free(v); free(out_p); free(out_m);
     free(vjp_z); free(vjp_theta); free(num_vjp_z); free(num_vjp_theta);
@@ -602,10 +674,69 @@ static void test_adjoint_gradients(RNG *r) {
 
 
 
+static void test_training(RNG *r) {
+    const int D = 2, H = 16;
+    const int N = 50, BATCH = 10, ITERS = 300;
+    const double t0 = 0.0, t1 = 1.0;
+    const double lr = 0.01, atol = 1e-4, rtol = 1e-4;
+
+    DynMLP net;
+    int nparams = dynmlp_nparams(D, H);
+    double *theta = vec_alloc(nparams);
+    dynmlp_init(&net, D, H, theta, r);
+
+    double **z0s     = (double **)xmalloc(N * sizeof(double *));
+    double **targets = (double **)xmalloc(N * sizeof(double *));
+    for (int i = 0; i < N; i++) {
+        double angle = 2.0 * M_PI * rng_uniform(r);
+        z0s[i]     = vec_alloc(D);
+        targets[i] = vec_alloc(D);
+        z0s[i][0]  =  cos(angle);
+        z0s[i][1]  =  sin(angle);
+        targets[i][0] = -z0s[i][1];
+        targets[i][1] =  z0s[i][0];
+    }
+
+    const double **batch_z0  = (const double **)xmalloc(BATCH * sizeof(double *));
+    const double **batch_tgt = (const double **)xmalloc(BATCH * sizeof(double *));
+
+    printf("\n--- Training test (D=2, H=16, 90-deg rotation) ---\n");
+    for (int iter = 0; iter < ITERS; iter++) {
+        for (int b = 0; b < BATCH; b++) {
+            int idx = (int)(rng_next(r) % (uint64_t)N);
+            batch_z0[b]  = z0s[idx];
+            batch_tgt[b] = targets[idx];
+        }
+        TrainStepResult res = train_step(&net, theta, batch_z0, batch_tgt,
+                                         t0, t1, BATCH, lr, atol, rtol);
+        if ((iter + 1) % 50 == 0)
+            printf("iter %3d  loss=%.4f  nfe_fwd=%d\n", iter + 1, res.loss, res.nfe_fwd);
+    }
+
+    AdjointCtx ac = { net, theta, D, nparams };
+    double final_loss = 0.0;
+    for (int i = 0; i < N; i++) {
+        ODEResult fwd = ode_solve(neural_ode_rhs, z0s[i], t0, t1, NULL, D, atol, rtol, &ac);
+        for (int j = 0; j < D; j++) {
+            double d = fwd.y[j] - targets[i][j];
+            final_loss += 0.5 * d * d;
+        }
+        free(fwd.y);
+    }
+    final_loss /= (double)N;
+    printf("Loss: %.4f\n", final_loss);
+
+    free(batch_z0); free(batch_tgt);
+    for (int i = 0; i < N; i++) { free(z0s[i]); free(targets[i]); }
+    free(z0s); free(targets);
+    free(theta);
+}
+
 int main(void) {
     RNG r = rng_init(42);
     test_ode_solver();
     test_dynmlp_gradients(&r);
     test_adjoint_gradients(&r);
+    test_training(&r);
     return 0;
 }
