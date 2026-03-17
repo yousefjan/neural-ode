@@ -457,8 +457,46 @@ NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *the
    § Training loop
    ============================================================ */
 
-static void sgd_update(double *theta, const double *grad, int nparams, double lr) {
-    for (int i = 0; i < nparams; i++) theta[i] -= lr * grad[i];
+
+typedef struct {
+    double *m;       /* first moment */
+    double *v;       /* second moment */
+    int     nparams;
+    double  lr;
+    double  beta1;
+    double  beta2;
+    double  eps;
+    int     t;       /* step count */
+} Adam;
+
+static Adam adam_init(int nparams, double lr, double beta1, double beta2, double eps) {
+    Adam a;
+    a.m = vec_zeros(nparams);
+    a.v = vec_zeros(nparams);
+    a.nparams = nparams;
+    a.lr = lr;
+    a.beta1 = beta1;
+    a.beta2 = beta2;
+    a.eps = eps;
+    a.t = 0;
+    return a;
+}
+
+static void adam_update(Adam *a, double *theta, const double *grad) {
+    a->t++;
+    double bc1 = 1.0 - pow(a->beta1, (double)a->t);
+    double bc2 = 1.0 - pow(a->beta2, (double)a->t);
+    double alpha = a->lr * sqrt(bc2) / bc1;
+    for (int i = 0; i < a->nparams; i++) {
+        a->m[i] = a->beta1 * a->m[i] + (1.0 - a->beta1) * grad[i];
+        a->v[i] = a->beta2 * a->v[i] + (1.0 - a->beta2) * grad[i] * grad[i];
+        theta[i] -= alpha * a->m[i] / (sqrt(a->v[i]) + a->eps);
+    }
+}
+
+static void adam_free(Adam *a) {
+    free(a->m);
+    free(a->v);
 }
 
 static double train_one(const DynMLP *net, const double *theta,
@@ -492,7 +530,7 @@ typedef struct {
 static TrainStepResult train_step(const DynMLP *net, double *theta,
                                   const double **z0s, const double **targets,
                                   double t0, double t1, int batch_size,
-                                  double lr, double atol, double rtol) {
+                                  Adam *adam, double atol, double rtol) {
     int nparams = net->nparams;
     double *grad_accum = vec_zeros(nparams);
     TrainStepResult res = { 0.0, 0, 0 };
@@ -503,7 +541,7 @@ static TrainStepResult train_step(const DynMLP *net, double *theta,
     }
     res.loss /= (double)batch_size;
     for (int i = 0; i < nparams; i++) grad_accum[i] /= (double)batch_size;
-    sgd_update(theta, grad_accum, nparams, lr);
+    adam_update(adam, theta, grad_accum);
     free(grad_accum);
     return res;
 }
@@ -678,12 +716,13 @@ static void test_training(RNG *r) {
     const int D = 2, H = 16;
     const int N = 50, BATCH = 10, ITERS = 300;
     const double t0 = 0.0, t1 = 1.0;
-    const double lr = 0.01, atol = 1e-4, rtol = 1e-4;
+    const double atol = 1e-4, rtol = 1e-4;
 
     DynMLP net;
     int nparams = dynmlp_nparams(D, H);
     double *theta = vec_alloc(nparams);
     dynmlp_init(&net, D, H, theta, r);
+    Adam adam = adam_init(nparams, 1e-3, 0.9, 0.999, 1e-8);
 
     double **z0s     = (double **)xmalloc(N * sizeof(double *));
     double **targets = (double **)xmalloc(N * sizeof(double *));
@@ -708,7 +747,7 @@ static void test_training(RNG *r) {
             batch_tgt[b] = targets[idx];
         }
         TrainStepResult res = train_step(&net, theta, batch_z0, batch_tgt,
-                                         t0, t1, BATCH, lr, atol, rtol);
+                                         t0, t1, BATCH, &adam, atol, rtol);
         if ((iter + 1) % 50 == 0)
             printf("iter %3d  loss=%.4f  nfe_fwd=%d\n", iter + 1, res.loss, res.nfe_fwd);
     }
@@ -726,6 +765,7 @@ static void test_training(RNG *r) {
     final_loss /= (double)N;
     printf("Loss: %.4f\n", final_loss);
 
+    adam_free(&adam);
     free(batch_z0); free(batch_tgt);
     for (int i = 0; i < N; i++) { free(z0s[i]); free(targets[i]); }
     free(z0s); free(targets);
