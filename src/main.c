@@ -1,5 +1,4 @@
-#include "utils.h"
-#include "dynmlp.h"
+#include "dynnet.h"
 #include "ode_solver.h"
 #include "adjoint.h"
 #include "adam.h"
@@ -18,10 +17,19 @@ int main(void) {
 
     /* --- sanity checks --- */
     test_ode_solver();
-    test_dynmlp_gradients(&r);
+    test_dynnet_gradients(&r);
     test_adjoint_gradients(&r);
     test_multi_obs_adjoint(&r);
     test_training(&r);
+
+    printf("\n--- DynNet tests ---\n");
+    test_dynnet_deep_gradients(&r);
+    test_dynnet_residual_gradients(&r);
+    test_dynnet_layernorm_gradients(&r);
+    test_dynnet_time_inject_gradients(&r);
+    test_dynnet_swish_gradients(&r);
+    test_dynnet_softplus_gradients(&r);
+    test_adjoint_deep(&r);
 
     printf("\n--- CNF tests ---\n");
     test_cnf_trace(&r);
@@ -46,10 +54,16 @@ int main(void) {
     Dataset test_ds  = generate_spiral_dataset(TEST_N,  t0, t1, noise_std, &r);
 
     const int D = 2, H = 32;
-    DynMLP net;
-    int nparams = dynmlp_nparams(D, H);
+    DynNet *net = dynnet_create(D);
+    dynnet_add_time_concat(net);
+    dynnet_add_linear(net, H);
+    dynnet_add_tanh(net);
+    dynnet_add_linear(net, D);
+    dynnet_finalize(net);
+
+    int nparams = net->total_params;
     double *theta = vec_alloc(nparams);
-    dynmlp_init(&net, D, H, theta, &r);
+    dynnet_init_params(net, theta, &r);
 
     Adam adam = adam_init(nparams, 1e-3, 0.9, 0.999, 1e-8);
 
@@ -67,12 +81,12 @@ int main(void) {
             batch_tgt[b] = train_ds.target[idx];
         }
 
-        TrainStepResult res = train_step(&net, theta, batch_z0, batch_tgt,
+        TrainStepResult res = train_step(net, theta, batch_z0, batch_tgt,
                                          t0, t1, BATCH, &adam,
                                          atol_train, rtol_train, 10);
 
         if (iter % LOG_EVERY == 0) {
-            double test_loss = evaluate(&net, theta, &test_ds,
+            double test_loss = evaluate(net, theta, &test_ds,
                                         t0, t1, atol_eval, rtol_eval);
             printf("%-6d  %-12.6f  %-12.6f  %-10d  %-10d\n",
                    iter, res.loss, test_loss,
@@ -85,14 +99,15 @@ int main(void) {
     free(batch_tgt);
 
     printf("\n--------------------------------------------------\n");
-    double final_test_loss = evaluate(&net, theta, &test_ds,
+    double final_test_loss = evaluate(net, theta, &test_ds,
                                       t0, t1, atol_eval, rtol_eval);
     printf("Final test loss : %.6f\n", final_test_loss);
     printf("Total parameters: %d\n", nparams);
 
     printf("\nSample predictions:\n");
-    Workspace ws = workspace_alloc(D, H, nparams);
-    AdjointCtx ac = { net, theta, D, nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
     for (int s = 0; s < 5; s++) {
         int idx = (int)(rng_next(&r) % (uint64_t)TEST_N);
         ODEResult fwd = ode_solve(neural_ode_rhs,
@@ -104,10 +119,12 @@ int main(void) {
                test_ds.target[idx][0], test_ds.target[idx][1]);
         free(fwd.y);
     }
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
 
     free(theta);
     adam_free(&adam);
+    dynnet_free(net);
     dataset_free(&train_ds);
     dataset_free(&test_ds);
 

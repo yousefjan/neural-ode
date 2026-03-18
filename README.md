@@ -4,36 +4,49 @@ A implementation of [Neural Ordinary Differential Equations by Chen et al. (2018
 
 ## Build
 ```bash
-cc -O2 -Wall -Wextra -Iinclude src/utils.c src/dynmlp.c src/ode_solver.c src/adjoint.c src/adam.c src/train.c src/spiral.c src/tests.c src/cnf.c src/cnf_train.c src/test_cnf.c src/main.c -lm -o neural_ode
+make
 ```
 
 ## Run
 ```bash
-./neural_ode
+make run
 ```
 
 ## Usage
 
-### DynMLP
+### DynNet
 
-A two-layer dynamic multi layer perceptron used as the ODE right-hand side: `dz/dt = f_θ(z, t)`.
+A composable network used as the ODE right-hand side: `dz/dt = f_θ(z, t)`. Build a network by stacking layers, then call `dynnet_finalize`.
 
 ```c
-#include "dynmlp.h"
+#include "dynnet.h"
 
-int     dynmlp_nparams(int D, int H);
-void    dynmlp_init(DynMLP *net, int D, int H, double *theta, RNG *r);
-void    dynmlp_forward(const DynMLP *net, const double *theta,
-                       const double *z, double t, double *out, Workspace *ws);
-void    dynmlp_vjp(const DynMLP *net, const double *theta,
-                   const double *z, double t, const double *v,
-                   double *vjp_z, double *vjp_theta, Workspace *ws);
+DynNet *dynnet_create(int D);
+void dynnet_add_linear(DynNet *net, int out_dim);
+void dynnet_add_tanh(DynNet *net);
+void dynnet_add_softplus(DynNet *net);
+void dynnet_add_swish(DynNet *net);
+void dynnet_add_layernorm(DynNet *net);
+void dynnet_add_residual_begin(DynNet *net);
+void dynnet_add_residual_end(DynNet *net);
+void dynnet_add_time_concat(DynNet *net);
+void dynnet_finalize(DynNet *net);
+void dynnet_init_params(DynNet *net, double *theta, RNG *r);
+void dynnet_free(DynNet *net);
+
+void dynnet_forward(DynNet *net, const double *theta,
+                    const double *z, double t, double *out, double *workspace);
+void dynnet_vjp(DynNet *net, const double *theta,
+                const double *z, double t, const double *v,
+                double *vjp_z, double *vjp_theta, double *workspace);
 ```
 
-- `D`: state dimension, `H`: hidden size.
-- `theta` must point to at least `dynmlp_nparams(D, H)` doubles (caller-owned).
-- `dynmlp_init` fills `theta` with random Xavier weights.
-- `Workspace` is a scratch buffer; allocate once with `workspace_alloc(D, H, nparams)` and free with `workspace_free`.
+- `D`: state dimension (input/output).
+- `theta` must point to at least `net->total_params` doubles (caller-owned).
+- `dynnet_init_params` fills `theta` with random Xavier weights.
+- `workspace` must be at least `net->total_workspace` doubles; allocate once and reuse.
+- `time_concat` appends `t` to the current feature vector (increases dim by 1).
+- Residual blocks: wrap layers between `residual_begin` / `residual_end` (dims must match).
 
 ### ODE solver
 
@@ -64,14 +77,14 @@ ODEResult ode_solve_times(ode_rhs_fn f, const double *y0, const double *times,
 
 // Single target: integrate z0 → z1, compute MSE loss, backprop via adjoint.
 NeuralODEOutput neural_ode_forward_backward(
-    const DynMLP *net, const double *theta,
+    DynNet *net, const double *theta,
     const double *z0, double t0, double t1,
     const double *target, double atol, double rtol,
     int num_checkpoints);
 
 // Multiple observation times: integrate z0 → z(times[0..ntimes-1]).
 MultiObsNeuralODEOutput neural_ode_forward_backward_multi(
-    const DynMLP *net, const double *theta,
+    DynNet *net, const double *theta,
     const double *z0, const double *times,
     const double *targets, int ntimes,
     double atol, double rtol);
@@ -83,12 +96,14 @@ Both outputs carry heap-allocated `dL_dz0` (`D` doubles) and `dL_dtheta`
 For inference only, set up an `AdjointCtx` and call `ode_solve` directly:
 
 ```c
-Workspace ws = workspace_alloc(D, H, nparams);
-AdjointCtx ctx = { net, theta, D, nparams, &ws };
+double *ws = vec_alloc(net->total_workspace);
+double *neg_a = vec_alloc(D);
+AdjointCtx ctx = { net, theta, ws, neg_a };
 ODEResult fwd = ode_solve(neural_ode_rhs, z0, t0, t1, NULL, D, atol, rtol, &ctx);
 // fwd.y holds the predicted state
 free(fwd.y);
-workspace_free(&ws);
+free(ws);
+free(neg_a);
 ```
 
 ### Adam optimizer
@@ -106,7 +121,7 @@ void adam_free(Adam *a);
 ```c
 #include "train.h"
 
-TrainStepResult train_step(const DynMLP *net, double *theta,
+TrainStepResult train_step(DynNet *net, double *theta,
                            const double **z0s, const double **targets,
                            double t0, double t1, int batch_size,
                            Adam *adam, double atol, double rtol,
@@ -154,19 +169,17 @@ double rng_normal(RNG *r);     // standard normal sample
 
 double *vec_alloc(int n);      // malloc n doubles
 double *vec_zeros(int n);      // calloc n doubles
-
-Workspace workspace_alloc(int D, int H, int nparams);
-void      workspace_free(Workspace *ws);
 ```
 
 ### End-to-end example
 
 ```c
 #include "utils.h"
-#include "dynmlp.h"
+#include "dynnet.h"
 #include "adjoint.h"
 #include "adam.h"
 #include "train.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 int main(void) {
@@ -174,34 +187,48 @@ int main(void) {
     const double t0 = 0.0, t1 = 1.5;
 
     RNG r = rng_init(42);
-    int nparams = dynmlp_nparams(D, H);
-    double *theta = vec_alloc(nparams);
 
-    DynMLP net;
-    dynmlp_init(&net, D, H, theta, &r);
+    DynNet *net = dynnet_create(D);
+    dynnet_add_time_concat(net);
+    dynnet_add_linear(net, H);
+    dynnet_add_tanh(net);
+    dynnet_add_linear(net, D);
+    dynnet_finalize(net);
+
+    int nparams = net->total_params;
+    double *theta = vec_alloc(nparams);
+    dynnet_init_params(net, theta, &r);
 
     Adam adam = adam_init(nparams, 1e-3, 0.9, 0.999, 1e-8);
 
-    // single training step
-    double z0[2]     = {1.0, 0.0};
+    // training data
+    double z0[2] = {1.0, 0.0};
     double target[2] = {0.0, 1.0};
     const double *z0s[]  = {z0};
     const double *tgts[] = {target};
 
-    TrainStepResult res = train_step(&net, theta, z0s, tgts,
-                                     t0, t1, 1, &adam,
-                                     1e-3, 1e-3, 10);
+    // training loop
+    for (int iter = 1; iter <= 500; iter++) {
+        TrainStepResult res = train_step(net, theta, z0s, tgts,
+                                         t0, t1, 1, &adam,
+                                         1e-3, 1e-3, 10);
+        if (iter % 100 == 0)
+            printf("iter %d  loss=%.4f\n", iter, res.loss);
+    }
 
     // inference
-    Workspace ws = workspace_alloc(D, H, nparams);
-    AdjointCtx ctx = { net, theta, D, nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ctx = { net, theta, ws, neg_a };
     ODEResult fwd = ode_solve(neural_ode_rhs, z0, t0, t1,
                               NULL, D, 1e-5, 1e-5, &ctx);
     free(fwd.y);
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
 
     free(theta);
     adam_free(&adam);
+    dynnet_free(net);
     return 0;
 }
 ```
@@ -209,9 +236,4 @@ int main(void) {
 
 ## TODOs
 
-- [ ] Deeper Networks
 - [ ] Data and training visualization (matplotlib)
-
-
-
-

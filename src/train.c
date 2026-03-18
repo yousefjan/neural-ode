@@ -4,7 +4,7 @@
 
 #include <stdlib.h>
 
-static double train_one(const DynMLP *net, const double *theta,
+static double train_one(DynNet *net, const double *theta,
                         const double *z0, double t0, double t1,
                         const double *target, double *grad_accum,
                         double atol, double rtol, int num_checkpoints,
@@ -17,7 +17,7 @@ static double train_one(const DynMLP *net, const double *theta,
         double d = out.z1[i] - target[i];
         loss += 0.5 * d * d;
     }
-    for (int i = 0; i < net->nparams; i++) grad_accum[i] += out.dL_dtheta[i];
+    for (int i = 0; i < net->total_params; i++) grad_accum[i] += out.dL_dtheta[i];
     *nfe_fwd += out.nfe_forward;
     *nfe_bwd += out.nfe_backward;
     free(out.z1);
@@ -26,11 +26,11 @@ static double train_one(const DynMLP *net, const double *theta,
     return loss;
 }
 
-TrainStepResult train_step(const DynMLP *net, double *theta,
+TrainStepResult train_step(DynNet *net, double *theta,
                            const double **z0s, const double **targets,
                            double t0, double t1, int batch_size,
                            Adam *adam, double atol, double rtol, int num_checkpoints) {
-    int nparams = net->nparams;
+    int nparams = net->total_params;
     double *grad_accum = vec_zeros(nparams);
     TrainStepResult res = { 0.0, 0, 0 };
 

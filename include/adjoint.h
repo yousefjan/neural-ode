@@ -1,15 +1,13 @@
 #pragma once
 
-#include "utils.h"
-#include "dynmlp.h"
+#include "dynnet.h"
 #include "ode_solver.h"
 
 typedef struct {
-    DynMLP net;
+    DynNet *net;
     const double *theta;
-    int state_dim;
-    int nparams;
-    Workspace *ws;
+    double *ws;    /* size net->total_workspace */
+    double *neg_a; /* size net->D */
 } AdjointCtx;
 
 typedef struct {
@@ -32,13 +30,13 @@ void neural_ode_rhs(const double *state, double t, const double *params,
                     int dim, double *out, void *ctx);
 
 NeuralODEOutput neural_ode_forward_backward(
-    const DynMLP *net, const double *theta,
+    DynNet *net, const double *theta,
     const double *z0, double t0, double t1,
     const double *target, double atol, double rtol,
     int num_checkpoints);
 
 MultiObsNeuralODEOutput neural_ode_forward_backward_multi(
-    const DynMLP *net, const double *theta,
+    DynNet *net, const double *theta,
     const double *z0, const double *times,
     const double *targets, int ntimes,
     double atol, double rtol);

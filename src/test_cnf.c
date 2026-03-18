@@ -7,45 +7,54 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* ---- Test 1: Trace via FD agrees with exact trace for linear f ---- */
+/* ---- Test 1: Trace via FD agrees with exact trace ---- */
 void test_cnf_trace(RNG *r) {
     const int D = 3, H = 8;
     const double atol = 1e-8, rtol = 1e-8;
     const double EPS_FD = 1e-5, TOL = 1e-4;
 
-    int nparams = dynmlp_nparams(D, H);
+    CNF cnf;
+    int nparams = 0;
+    {
+        DynNet *tmp = dynnet_create(D);
+        dynnet_add_time_concat(tmp);
+        dynnet_add_linear(tmp, H);
+        dynnet_add_tanh(tmp);
+        dynnet_add_linear(tmp, D);
+        dynnet_finalize(tmp);
+        nparams = tmp->total_params;
+        dynnet_free(tmp);
+    }
     double *theta = vec_alloc(nparams);
-    DynMLP net;
-    dynmlp_init(&net, D, H, theta, r);
+    cnf_init(&cnf, D, H, theta, r);
 
     double z[3];
     for (int i = 0; i < D; i++) z[i] = rng_normal(r);
     double t = 0.5;
 
-    Workspace ws = workspace_alloc(D, H, nparams);
+    double *ws  = vec_alloc(cnf.net->total_workspace);
     double *z_p = vec_alloc(D), *f_p = vec_alloc(D), *f_m = vec_alloc(D);
 
     double tr_fd = 0.0;
     for (int i = 0; i < D; i++) {
         vec_copy(z, z_p, D);
         z_p[i] += EPS_FD;
-        dynmlp_forward(&net, theta, z_p, t, f_p, &ws);
+        dynnet_forward(cnf.net, theta, z_p, t, f_p, ws);
         z_p[i] = z[i] - EPS_FD;
-        dynmlp_forward(&net, theta, z_p, t, f_m, &ws);
+        dynnet_forward(cnf.net, theta, z_p, t, f_m, ws);
         tr_fd += (f_p[i] - f_m[i]) / (2.0 * EPS_FD);
     }
 
     double *out0 = vec_alloc(D);
-    dynmlp_forward(&net, theta, z, t, out0, &ws);
+    dynnet_forward(cnf.net, theta, z, t, out0, ws);
     double tr_jac = 0.0;
     for (int i = 0; i < D; i++) {
         double *col_p = vec_alloc(D), *col_m = vec_alloc(D);
         vec_copy(z, z_p, D);
         z_p[i] += EPS_FD;
-        dynmlp_forward(&net, theta, z_p, t, col_p, &ws);
+        dynnet_forward(cnf.net, theta, z_p, t, col_p, ws);
         z_p[i] = z[i] - EPS_FD;
-        dynmlp_forward(&net, theta, z_p, t, col_m, &ws);
-        /* J[:,i] = (col_p - col_m) / (2*eps); diagonal entry = row i */
+        dynnet_forward(cnf.net, theta, z_p, t, col_m, ws);
         tr_jac += (col_p[i] - col_m[i]) / (2.0 * EPS_FD);
         free(col_p); free(col_m);
     }
@@ -53,11 +62,6 @@ void test_cnf_trace(RNG *r) {
     double err = fabs(tr_fd - tr_jac);
     printf("CNF trace vs full Jacobian trace: err=%.2e  tr_fd=%.6f  tr_jac=%.6f  %s\n",
            err, tr_fd, tr_jac, err < TOL ? "PASS" : "FAIL");
-
-    CNF cnf;
-    cnf.net = net;
-    cnf.nparams = nparams;
-    cnf.trace_eps = EPS_FD;
 
     double dt = 1e-4;
     CNFSampleResult sr = cnf_sample(&cnf, theta, z, 0.0, dt, atol, rtol);
@@ -67,8 +71,9 @@ void test_cnf_trace(RNG *r) {
            err2, err2 < 1e-2 ? "PASS" : "FAIL");
     free(sr.z1);
 
-    workspace_free(&ws);
-    free(theta); free(z_p); free(f_p); free(f_m); free(out0);
+    free(ws); free(z_p); free(f_p); free(f_m); free(out0);
+    cnf_free(&cnf);
+    free(theta);
 }
 
 /* ---- Test 2: cnf_sample followed by cnf_log_prob recovers z0 ---- */
@@ -77,7 +82,17 @@ void test_cnf_invertibility(RNG *r) {
     const double atol = 1e-8, rtol = 1e-8, TOL = 1e-4;
     const double t0 = 0.0, t1 = 1.0;
 
-    int nparams = dynmlp_nparams(D, H);
+    int nparams = 0;
+    {
+        DynNet *tmp = dynnet_create(D);
+        dynnet_add_time_concat(tmp);
+        dynnet_add_linear(tmp, H);
+        dynnet_add_tanh(tmp);
+        dynnet_add_linear(tmp, D);
+        dynnet_finalize(tmp);
+        nparams = tmp->total_params;
+        dynnet_free(tmp);
+    }
     double *theta = vec_alloc(nparams);
     CNF cnf;
     cnf_init(&cnf, D, H, theta, r);
@@ -86,7 +101,6 @@ void test_cnf_invertibility(RNG *r) {
     for (int i = 0; i < D; i++) z0[i] = rng_normal(r);
 
     CNFSampleResult sr = cnf_sample(&cnf, theta, z0, t0, t1, atol, rtol);
-
     CNFLogProbResult lr = cnf_log_prob(&cnf, theta, sr.z1, t0, t1, atol, rtol);
 
     double err = 0.0;
@@ -95,7 +109,6 @@ void test_cnf_invertibility(RNG *r) {
         err += d * d;
     }
     err = sqrt(err);
-
     double logp_err = fabs(sr.delta_logp - lr.delta_logp);
 
     printf("CNF invertibility: z0_err=%.2e  logp_err=%.2e  nfe_fwd=%d  nfe_bwd=%d  %s\n",
@@ -103,6 +116,7 @@ void test_cnf_invertibility(RNG *r) {
            (err < TOL && logp_err < TOL) ? "PASS" : "FAIL");
 
     free(theta); free(sr.z1); free(lr.z0);
+    cnf_free(&cnf);
 }
 
 /* ---- Test 3: adjoint gradients via finite differences ---- */
@@ -111,7 +125,17 @@ void test_cnf_gradients(RNG *r) {
     const double EPS = 1e-5, atol = 1e-7, rtol = 1e-7;
     const double t0 = 0.0, t1 = 0.5;
 
-    int nparams = dynmlp_nparams(D, H);
+    int nparams = 0;
+    {
+        DynNet *tmp = dynnet_create(D);
+        dynnet_add_time_concat(tmp);
+        dynnet_add_linear(tmp, H);
+        dynnet_add_tanh(tmp);
+        dynnet_add_linear(tmp, D);
+        dynnet_finalize(tmp);
+        nparams = tmp->total_params;
+        dynnet_free(tmp);
+    }
     double *theta = vec_alloc(nparams);
     CNF cnf;
     cnf_init(&cnf, D, H, theta, r);
@@ -164,6 +188,7 @@ void test_cnf_gradients(RNG *r) {
     free(theta); free(z1); free(dL_dz1);
     free(br.dL_dz0); free(br.dL_dtheta);
     free(num_grad);
+    cnf_free(&cnf);
 }
 
 /* ---- Test 4: training loss decreases on a simple target ---- */
@@ -173,7 +198,17 @@ void test_cnf_training(RNG *r) {
     const double t0 = 0.0, t1 = 1.0;
     const double atol = 1e-4, rtol = 1e-4;
 
-    int nparams = dynmlp_nparams(D, H);
+    int nparams = 0;
+    {
+        DynNet *tmp = dynnet_create(D);
+        dynnet_add_time_concat(tmp);
+        dynnet_add_linear(tmp, H);
+        dynnet_add_tanh(tmp);
+        dynnet_add_linear(tmp, D);
+        dynnet_finalize(tmp);
+        nparams = tmp->total_params;
+        dynnet_free(tmp);
+    }
     double *theta = vec_alloc(nparams);
     CNF cnf;
     cnf_init(&cnf, D, H, theta, r);
@@ -225,7 +260,7 @@ void test_cnf_training(RNG *r) {
             free(z1);
         }
 
-        if (iter == 0)        first_loss = loss / BATCH;
+        if (iter == 0)         first_loss = loss / BATCH;
         if (iter == ITERS - 1) last_loss  = loss / BATCH;
 
         adam_update(&adam, theta, dL_dtheta_acc);
@@ -236,5 +271,6 @@ void test_cnf_training(RNG *r) {
            first_loss, last_loss, last_loss < first_loss ? "PASS" : "FAIL");
 
     adam_free(&adam);
+    cnf_free(&cnf);
     free(theta);
 }

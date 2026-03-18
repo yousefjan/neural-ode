@@ -26,34 +26,26 @@ void neural_ode_rhs(const double *state, double t, const double *params,
                     int dim, double *out, void *ctx) {
     (void)params;
     (void)dim;
-
     AdjointCtx *ac = (AdjointCtx *)ctx;
-    dynmlp_forward(&ac->net, ac->theta, state, t, out, ac->ws);
+    dynnet_forward(ac->net, ac->theta, state, t, out, ac->ws);
 }
 
 static void adjoint_dynamics(const double *aug_state, double t, const double *params,
-                             int aug_dim, double *aug_out, void *ctx) {
+                              int aug_dim, double *aug_out, void *ctx) {
     (void)params;
     (void)aug_dim;
-
     AdjointCtx *ac = (AdjointCtx *)ctx;
-    int D = ac->state_dim;
-    int nparams = ac->nparams;
+    int D       = ac->net->D;
+    int nparams = ac->net->total_params;
     const double *z = aug_state;
     const double *a = aug_state + D;
 
-    dynmlp_forward(&ac->net, ac->theta, z, t, aug_out, ac->ws);
+    dynnet_forward(ac->net, ac->theta, z, t, aug_out, ac->ws);
 
-    double *neg_a     = ac->ws->neg_a;
-    double *vjp_z     = ac->ws->vjp_z;
-    double *vjp_theta = ac->ws->vjp_theta;
-    vec_zero(vjp_theta, nparams);
-    for (int i = 0; i < D; i++) neg_a[i] = -a[i];
-
-    dynmlp_vjp(&ac->net, ac->theta, z, t, neg_a, vjp_z, vjp_theta, ac->ws);
-
-    vec_copy(vjp_z, aug_out + D, D);
-    vec_copy(vjp_theta, aug_out + 2 * D, nparams);
+    for (int i = 0; i < D; i++) ac->neg_a[i] = -a[i];
+    vec_zero(aug_out + 2 * D, nparams);
+    dynnet_vjp(ac->net, ac->theta, z, t, ac->neg_a,
+               aug_out + D, aug_out + 2 * D, ac->ws);
 }
 
 static void forward_result_free(ForwardResult *fr) {
@@ -64,12 +56,13 @@ static void forward_result_free(ForwardResult *fr) {
     free(fr->z1);
 }
 
-static ForwardResult forward_solve(const DynMLP *net, const double *theta,
+static ForwardResult forward_solve(DynNet *net, const double *theta,
                                    const double *z0, double t0, double t1,
                                    double atol, double rtol, int num_checkpoints) {
     int D = net->D;
-    Workspace ws = workspace_alloc(D, net->H, net->nparams);
-    AdjointCtx ac = { *net, theta, D, net->nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
 
     ForwardResult fr;
     fr.num_checkpoints = num_checkpoints;
@@ -97,23 +90,25 @@ static ForwardResult forward_solve(const DynMLP *net, const double *theta,
     fr.z1 = vec_alloc(D);
     vec_copy(fr.states[num_checkpoints], fr.z1, D);
 
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
     return fr;
 }
 
-static AdjointResult adjoint_solve(const DynMLP *net, const double *theta,
+static AdjointResult adjoint_solve(DynNet *net, const double *theta,
                                    const ForwardResult *fr, const double *dL_dz1,
                                    double atol, double rtol) {
-    int D = net->D;
-    int nparams = net->nparams;
+    int D       = net->D;
+    int nparams = net->total_params;
     int aug_dim = 2 * D + nparams;
 
     double *aug = vec_zeros(aug_dim);
     vec_copy(fr->z1, aug, D);
     vec_copy(dL_dz1, aug + D, D);
 
-    Workspace ws = workspace_alloc(D, net->H, nparams);
-    AdjointCtx ac = { *net, theta, D, nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
     int total_nfe = 0;
 
     for (int k = fr->num_checkpoints; k >= 1; k--) {
@@ -132,15 +127,16 @@ static AdjointResult adjoint_solve(const DynMLP *net, const double *theta,
     ar.dL_dz0    = vec_alloc(D);
     ar.dL_dtheta = vec_alloc(nparams);
     ar.nfe       = total_nfe;
-    vec_copy(aug + D, ar.dL_dz0, D);
-    vec_copy(aug + 2 * D, ar.dL_dtheta, nparams);
+    vec_copy(aug + D,       ar.dL_dz0,    D);
+    vec_copy(aug + 2 * D,   ar.dL_dtheta, nparams);
 
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
     free(aug);
     return ar;
 }
 
-NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *theta,
+NeuralODEOutput neural_ode_forward_backward(DynNet *net, const double *theta,
                                             const double *z0, double t0, double t1,
                                             const double *target, double atol, double rtol,
                                             int num_checkpoints) {
@@ -167,7 +163,7 @@ NeuralODEOutput neural_ode_forward_backward(const DynMLP *net, const double *the
 }
 
 static MultiObsAdjointResult adjoint_solve_multi(
-    const DynMLP *net,
+    DynNet *net,
     const double *theta,
     const double *z_traj,
     const double *times,
@@ -177,16 +173,17 @@ static MultiObsAdjointResult adjoint_solve_multi(
     double rtol)
 {
     int D       = net->D;
-    int nparams = net->nparams;
+    int nparams = net->total_params;
     int aug_dim = 2 * D + nparams;
 
-    Workspace ws = workspace_alloc(D, net->H, nparams);
-    AdjointCtx ac = { *net, theta, D, nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
 
-    double *a = vec_alloc(D);
+    double *a      = vec_alloc(D);
     double *dtheta = vec_zeros(nparams);
-    double *aug = vec_alloc(aug_dim);
-    int total_nfe = 0;
+    double *aug    = vec_alloc(aug_dim);
+    int total_nfe  = 0;
 
     vec_copy(dL_dz_each + (ntimes - 1) * D, a, D);
 
@@ -202,8 +199,8 @@ static MultiObsAdjointResult adjoint_solve_multi(
         total_nfe += seg.nfe;
         free(seg.y);
 
-        vec_copy(aug + D, a, D);
-        vec_copy(aug + 2 * D, dtheta, nparams);
+        vec_copy(aug + D,       a,      D);
+        vec_copy(aug + 2 * D,   dtheta, nparams);
 
         /* Kick: add per-observation loss gradient at time t_{i-1} */
         vec_add_scaled(a, 1.0, dL_dz_each + (i - 1) * D, D);
@@ -214,13 +211,14 @@ static MultiObsAdjointResult adjoint_solve_multi(
     result.dL_dtheta = dtheta;
     result.nfe       = total_nfe;
 
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
     free(aug);
     return result;
 }
 
 MultiObsNeuralODEOutput neural_ode_forward_backward_multi(
-    const DynMLP *net,
+    DynNet *net,
     const double *theta,
     const double *z0,
     const double *times,
@@ -230,12 +228,14 @@ MultiObsNeuralODEOutput neural_ode_forward_backward_multi(
     double rtol)
 {
     int D = net->D;
-    Workspace ws = workspace_alloc(D, net->H, net->nparams);
-    AdjointCtx ac = { *net, theta, D, net->nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
 
     ODEResult fwd = ode_solve_times(neural_ode_rhs, z0, times, ntimes,
                                     NULL, D, atol, rtol, &ac);
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
 
     double *dL_dz_each = vec_alloc(ntimes * D);
     for (int i = 0; i < ntimes * D; i++)

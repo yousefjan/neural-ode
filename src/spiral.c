@@ -52,12 +52,13 @@ void dataset_free(Dataset *ds) {
     free(ds->target);
 }
 
-double evaluate(const DynMLP *net, const double *theta,
+double evaluate(DynNet *net, const double *theta,
                 const Dataset *ds, double t0, double t1,
                 double atol, double rtol) {
     int D = net->D;
-    Workspace ws = workspace_alloc(D, net->H, net->nparams);
-    AdjointCtx ac = { *net, theta, D, net->nparams, &ws };
+    double *ws    = vec_alloc(net->total_workspace);
+    double *neg_a = vec_alloc(D);
+    AdjointCtx ac = { net, theta, ws, neg_a };
     double total_loss = 0.0;
     for (int i = 0; i < ds->num_samples; i++) {
         ODEResult fwd = ode_solve(neural_ode_rhs, ds->z0[i], t0, t1,
@@ -68,6 +69,7 @@ double evaluate(const DynMLP *net, const double *theta,
         }
         free(fwd.y);
     }
-    workspace_free(&ws);
+    free(ws);
+    free(neg_a);
     return total_loss / (double)ds->num_samples;
 }

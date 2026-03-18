@@ -51,7 +51,17 @@ void cnf_train_demo(RNG *r) {
     const double atol = 1e-4, rtol = 1e-4;
     const double LR = 1e-3;
 
-    int nparams = dynmlp_nparams(D, H);
+    int nparams = 0;
+    {
+        DynNet *tmp = dynnet_create(D);
+        dynnet_add_time_concat(tmp);
+        dynnet_add_linear(tmp, H);
+        dynnet_add_tanh(tmp);
+        dynnet_add_linear(tmp, D);
+        dynnet_finalize(tmp);
+        nparams = tmp->total_params;
+        dynnet_free(tmp);
+    }
     double *theta = vec_alloc(nparams);
     CNF cnf;
     cnf_init(&cnf, D, H, theta, r);
@@ -80,8 +90,7 @@ void cnf_train_demo(RNG *r) {
             double log_pm = log_pb + sr.delta_logp;
             double log_pt = log_p_target(z1);
 
-             *   = log_pb + delta_logp - log_pt
-             * (KL(p_model || p_target) estimator) */
+            /* KL(p_model || p_target) estimator */
             loss += log_pm - log_pt;
 
             double dL_dz1[2];
@@ -124,5 +133,6 @@ void cnf_train_demo(RNG *r) {
     printf("Total parameters: %d\n", nparams);
 
     adam_free(&adam);
+    cnf_free(&cnf);
     free(theta);
 }

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "dynmlp.h"
+#include "dynnet.h"
 #include "adam.h"
 
 typedef struct {
@@ -9,7 +9,7 @@ typedef struct {
     int nfe_bwd;
 } TrainStepResult;
 
-TrainStepResult train_step(const DynMLP *net, double *theta,
+TrainStepResult train_step(DynNet *net, double *theta,
                            const double **z0s, const double **targets,
                            double t0, double t1, int batch_size,
                            Adam *adam, double atol, double rtol,
