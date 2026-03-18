@@ -1,0 +1,47 @@
+[
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/utils.c -o src/utils.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/utils.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/dynmlp.c -o src/dynmlp.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/dynmlp.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/ode_solver.c -o src/ode_solver.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/ode_solver.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/adjoint.c -o src/adjoint.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/adjoint.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/adam.c -o src/adam.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/adam.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/train.c -o src/train.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/train.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/spiral.c -o src/spiral.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/spiral.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/tests.c -o src/tests.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/tests.c"
+  },
+  {
+    "directory": "/Users/yousefjan/yousefjan/neural-ode",
+    "command": "cc -std=c11 -Wall -Wextra -I/Users/yousefjan/yousefjan/neural-ode/include -c src/main.c -o src/main.o",
+    "file": "/Users/yousefjan/yousefjan/neural-ode/src/main.c"
+  }
+]
