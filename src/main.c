@@ -6,6 +6,8 @@
 #include "train.h"
 #include "spiral.h"
 #include "tests.h"
+#include "test_cnf.h"
+#include "cnf_train.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +22,14 @@ int main(void) {
     test_adjoint_gradients(&r);
     test_multi_obs_adjoint(&r);
     test_training(&r);
+
+    printf("\n--- CNF tests ---\n");
+    test_cnf_trace(&r);
+    test_cnf_invertibility(&r);
+    test_cnf_gradients(&r);
+    test_cnf_training(&r);
+
+    cnf_train_demo(&r);
 
     printf("\n--- Training demo (spiral) ---\n\n");
 
