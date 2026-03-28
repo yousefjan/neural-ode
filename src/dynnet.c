@@ -71,24 +71,26 @@ static int linear_ws(const void *cfg) { (void)cfg; return 0; }
 
 static void tanh_forward(const void *cfg, const double *theta,
                           const double *in, double *out, double *workspace) {
-    (void)theta; (void)workspace;
+    (void)theta;
     const ActCfg *c = (const ActCfg *)cfg;
-    for (int i = 0; i < c->dim; i++) out[i] = tanh(in[i]);
+    for (int i = 0; i < c->dim; i++) { workspace[i] = tanh(in[i]); out[i] = workspace[i]; }
 }
 
 static void tanh_vjp(const void *cfg, const double *theta,
                       const double *in, const double *v_out,
                       double *v_in, double *v_theta, double *workspace) {
-    (void)theta; (void)v_theta; (void)workspace;
+    (void)theta; (void)v_theta; (void)in;
     const ActCfg *c = (const ActCfg *)cfg;
     for (int i = 0; i < c->dim; i++) {
-        double h = tanh(in[i]);
+        double h = workspace[i];
         v_in[i] = (1.0 - h * h) * v_out[i];
     }
 }
 
 static int act_nparams(const void *cfg) { (void)cfg; return 0; }
-static int act_ws(const void *cfg) { (void)cfg; return 0; }
+static int tanh_ws(const void *cfg)     { return ((const ActCfg *)cfg)->dim; }
+static int softplus_ws(const void *cfg) { return ((const ActCfg *)cfg)->dim; }
+static int swish_ws(const void *cfg)    { return ((const ActCfg *)cfg)->dim; }
 
 
 static inline double softplus(double x) {
@@ -101,35 +103,35 @@ static inline double sigmoid(double x) {
 
 static void softplus_forward(const void *cfg, const double *theta,
                               const double *in, double *out, double *workspace) {
-    (void)theta; (void)workspace;
+    (void)theta;
     const ActCfg *c = (const ActCfg *)cfg;
-    for (int i = 0; i < c->dim; i++) out[i] = softplus(in[i]);
+    for (int i = 0; i < c->dim; i++) { workspace[i] = sigmoid(in[i]); out[i] = softplus(in[i]); }
 }
 
 static void softplus_vjp(const void *cfg, const double *theta,
                           const double *in, const double *v_out,
                           double *v_in, double *v_theta, double *workspace) {
-    (void)theta; (void)v_theta; (void)workspace;
+    (void)theta; (void)v_theta; (void)in;
     const ActCfg *c = (const ActCfg *)cfg;
     for (int i = 0; i < c->dim; i++)
-        v_in[i] = sigmoid(in[i]) * v_out[i];
+        v_in[i] = workspace[i] * v_out[i];
 }
 
 
 static void swish_forward(const void *cfg, const double *theta,
                            const double *in, double *out, double *workspace) {
-    (void)theta; (void)workspace;
+    (void)theta;
     const ActCfg *c = (const ActCfg *)cfg;
-    for (int i = 0; i < c->dim; i++) out[i] = in[i] * sigmoid(in[i]);
+    for (int i = 0; i < c->dim; i++) { workspace[i] = sigmoid(in[i]); out[i] = in[i] * workspace[i]; }
 }
 
 static void swish_vjp(const void *cfg, const double *theta,
                        const double *in, const double *v_out,
                        double *v_in, double *v_theta, double *workspace) {
-    (void)theta; (void)v_theta; (void)workspace;
+    (void)theta; (void)v_theta;
     const ActCfg *c = (const ActCfg *)cfg;
     for (int i = 0; i < c->dim; i++) {
-        double s = sigmoid(in[i]);
+        double s = workspace[i];
         v_in[i] = (s + in[i] * s * (1.0 - s)) * v_out[i];
     }
 }
@@ -258,9 +260,9 @@ static int residual_ws(const void *cfg) {
 
 
 static const LayerOps linear_ops     = { linear_forward,      linear_vjp,      linear_nparams,      linear_ws      };
-static const LayerOps tanh_ops       = { tanh_forward,        tanh_vjp,        act_nparams,         act_ws         };
-static const LayerOps softplus_ops   = { softplus_forward,    softplus_vjp,    act_nparams,         act_ws         };
-static const LayerOps swish_ops      = { swish_forward,       swish_vjp,       act_nparams,         act_ws         };
+static const LayerOps tanh_ops       = { tanh_forward,        tanh_vjp,        act_nparams,         tanh_ws        };
+static const LayerOps softplus_ops   = { softplus_forward,    softplus_vjp,    act_nparams,         softplus_ws    };
+static const LayerOps swish_ops      = { swish_forward,       swish_vjp,       act_nparams,         swish_ws       };
 static const LayerOps layernorm_ops  = { layernorm_forward,   layernorm_vjp,   layernorm_nparams,   layernorm_ws   };
 static const LayerOps time_concat_ops = { time_concat_forward, time_concat_vjp, time_concat_nparams, time_concat_ws };
 static const LayerOps residual_ops   = { residual_forward,    residual_vjp,    residual_nparams,    residual_ws    };

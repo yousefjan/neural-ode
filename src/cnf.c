@@ -48,15 +48,13 @@ typedef struct {
     double      *ws;
     double       eps;
     double       a_logp;
-    double *z_oj;
-    double *z_p2, *f_p2, *f_m2;
-    double *neg_a_z;
-    double *dg_tmp;
-    double *da_z_tmp;
-    double *v_ei;
-    double *vjp_z_tmp;
-    double *vjp_th_p;
-    double *vjp_th_m;
+    int          n_hutchinson;
+    /* Shared scratch */
+    double *z_oj, *neg_a_z, *dg_tmp, *vjp_th_p, *vjp_th_m;
+    /* Exact-trace scratch (n_hutchinson == 0) */
+    double *z_p2, *f_p2, *f_m2, *da_z_tmp, *v_ei, *vjp_z_tmp;
+    /* Hutchinson scratch (n_hutchinson > 0) */
+    double *v, *vjp_z_p, *vjp_z_m;
 } CNFAdjCtx;
 
 static void cnf_adj_rhs(const double *aug, double t, const double *params,
@@ -78,37 +76,60 @@ static void cnf_adj_rhs(const double *aug, double t, const double *params,
 
     if (cc->a_logp == 0.0) return;
 
-    for (int j = 0; j < D; j++) {
-        vec_copy(z, cc->z_oj, D);
-        cc->z_oj[j] += cc->eps;
-        double tr_p = compute_trace_fd(cc->net, cc->theta, cc->z_oj, t, cc->ws,
-                                       cc->eps, cc->z_p2, cc->f_p2, cc->f_m2);
-        cc->z_oj[j] = z[j] - cc->eps;
-        double tr_m = compute_trace_fd(cc->net, cc->theta, cc->z_oj, t, cc->ws,
-                                       cc->eps, cc->z_p2, cc->f_p2, cc->f_m2);
-        out[D + j] += cc->a_logp * (tr_p - tr_m) / (2.0 * cc->eps);
-    }
+    double scale = cc->a_logp / (2.0 * cc->eps);
 
-    vec_zero(cc->v_ei, D);
-    for (int i = 0; i < D; i++) {
-        cc->v_ei[i] = 1.0;
-
-        vec_copy(z, cc->z_oj, D);
-        cc->z_oj[i] += cc->eps;
+    if (cc->n_hutchinson > 0) {
+        /* Hutchinson estimator: tr(J) ≈ v^T J v  (Rademacher v in cc->v)
+         *   ∂(v^T J v)/∂z = (J(z+ε*v)^T v − J(z−ε*v)^T v) / (2ε)
+         *   ∂(v^T J v)/∂θ = (VJP_θ(z+ε*v, v) − VJP_θ(z−ε*v, v)) / (2ε)
+         * Both fall out of 2 dynnet_vjp calls at z±ε*v with tangent v. */
+        double *v = cc->v;
+        for (int i = 0; i < D; i++) cc->z_oj[i] = z[i] + cc->eps * v[i];
         vec_zero(cc->vjp_th_p, nparams);
-        dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, cc->v_ei,
-                   cc->vjp_z_tmp, cc->vjp_th_p, cc->ws);
+        dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, v,
+                   cc->vjp_z_p, cc->vjp_th_p, cc->ws);
 
-        cc->z_oj[i] = z[i] - cc->eps;
+        for (int i = 0; i < D; i++) cc->z_oj[i] = z[i] - cc->eps * v[i];
         vec_zero(cc->vjp_th_m, nparams);
-        dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, cc->v_ei,
-                   cc->vjp_z_tmp, cc->vjp_th_m, cc->ws);
+        dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, v,
+                   cc->vjp_z_m, cc->vjp_th_m, cc->ws);
 
-        cc->v_ei[i] = 0.0;
-
-        double scale = cc->a_logp / (2.0 * cc->eps);
+        for (int j = 0; j < D; j++)
+            out[D + j] += scale * (cc->vjp_z_p[j] - cc->vjp_z_m[j]);
         for (int k = 0; k < nparams; k++)
             out[2 * D + k] += scale * (cc->vjp_th_p[k] - cc->vjp_th_m[k]);
+    } else {
+        for (int j = 0; j < D; j++) {
+            vec_copy(z, cc->z_oj, D);
+            cc->z_oj[j] += cc->eps;
+            double tr_p = compute_trace_fd(cc->net, cc->theta, cc->z_oj, t, cc->ws,
+                                           cc->eps, cc->z_p2, cc->f_p2, cc->f_m2);
+            cc->z_oj[j] = z[j] - cc->eps;
+            double tr_m = compute_trace_fd(cc->net, cc->theta, cc->z_oj, t, cc->ws,
+                                           cc->eps, cc->z_p2, cc->f_p2, cc->f_m2);
+            out[D + j] += cc->a_logp * (tr_p - tr_m) / (2.0 * cc->eps);
+        }
+
+        vec_zero(cc->v_ei, D);
+        for (int i = 0; i < D; i++) {
+            cc->v_ei[i] = 1.0;
+
+            vec_copy(z, cc->z_oj, D);
+            cc->z_oj[i] += cc->eps;
+            vec_zero(cc->vjp_th_p, nparams);
+            dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, cc->v_ei,
+                       cc->vjp_z_tmp, cc->vjp_th_p, cc->ws);
+
+            cc->z_oj[i] = z[i] - cc->eps;
+            vec_zero(cc->vjp_th_m, nparams);
+            dynnet_vjp(cc->net, cc->theta, cc->z_oj, t, cc->v_ei,
+                       cc->vjp_z_tmp, cc->vjp_th_m, cc->ws);
+
+            cc->v_ei[i] = 0.0;
+
+            for (int k = 0; k < nparams; k++)
+                out[2 * D + k] += scale * (cc->vjp_th_p[k] - cc->vjp_th_m[k]);
+        }
     }
 }
 
@@ -122,9 +143,11 @@ void cnf_init(CNF *cnf, int D, int H, double *theta, RNG *r) {
     dynnet_add_linear(net, D);
     dynnet_finalize(net);
     dynnet_init_params(net, theta, r);
-    cnf->net       = net;
-    cnf->nparams   = net->total_params;
-    cnf->trace_eps = 1e-5;
+    cnf->net          = net;
+    cnf->nparams      = net->total_params;
+    cnf->trace_eps    = 1e-5;
+    cnf->rng          = *r;
+    cnf->n_hutchinson = 0;
 }
 
 void cnf_free(CNF *cnf) {
@@ -195,24 +218,36 @@ CNFBackwardResult cnf_backward(CNF *cnf, const double *theta,
     double *ws = vec_alloc(cnf->net->total_workspace);
 
     CNFAdjCtx ctx;
-    ctx.net     = cnf->net;
-    ctx.theta   = theta;
-    ctx.D       = D;
-    ctx.nparams = nparams;
-    ctx.ws      = ws;
-    ctx.eps     = cnf->trace_eps;
-    ctx.a_logp  = dL_dlogp;
-    ctx.z_oj    = vec_alloc(D);
-    ctx.z_p2    = vec_alloc(D);
-    ctx.f_p2    = vec_alloc(D);
-    ctx.f_m2    = vec_alloc(D);
-    ctx.neg_a_z = vec_alloc(D);
-    ctx.dg_tmp  = vec_alloc(nparams);
-    ctx.da_z_tmp = vec_alloc(D);
-    ctx.v_ei    = vec_zeros(D);
-    ctx.vjp_z_tmp = vec_alloc(D);
-    ctx.vjp_th_p  = vec_alloc(nparams);
-    ctx.vjp_th_m  = vec_alloc(nparams);
+    ctx.net           = cnf->net;
+    ctx.theta         = theta;
+    ctx.D             = D;
+    ctx.nparams       = nparams;
+    ctx.ws            = ws;
+    ctx.eps           = cnf->trace_eps;
+    ctx.a_logp        = dL_dlogp;
+    ctx.n_hutchinson  = cnf->n_hutchinson;
+    ctx.z_oj          = vec_alloc(D);
+    ctx.neg_a_z       = vec_alloc(D);
+    ctx.dg_tmp        = vec_alloc(nparams);
+    ctx.vjp_th_p      = vec_alloc(nparams);
+    ctx.vjp_th_m      = vec_alloc(nparams);
+    if (cnf->n_hutchinson > 0) {
+        ctx.v       = vec_alloc(D);
+        ctx.vjp_z_p = vec_alloc(D);
+        ctx.vjp_z_m = vec_alloc(D);
+        for (int i = 0; i < D; i++)
+            ctx.v[i] = (rng_next(&cnf->rng) & 1) ? 1.0 : -1.0;
+        ctx.z_p2 = ctx.f_p2 = ctx.f_m2 = NULL;
+        ctx.da_z_tmp = ctx.v_ei = ctx.vjp_z_tmp = NULL;
+    } else {
+        ctx.z_p2      = vec_alloc(D);
+        ctx.f_p2      = vec_alloc(D);
+        ctx.f_m2      = vec_alloc(D);
+        ctx.da_z_tmp  = vec_alloc(D);
+        ctx.v_ei      = vec_zeros(D);
+        ctx.vjp_z_tmp = vec_alloc(D);
+        ctx.v = ctx.vjp_z_p = ctx.vjp_z_m = NULL;
+    }
 
     double *aug = vec_zeros(aug_dim);
     vec_copy(z1, aug, D);
@@ -230,9 +265,14 @@ CNFBackwardResult cnf_backward(CNF *cnf, const double *theta,
     out.nfe = res.nfe;
     free(res.y);
 
-    free(ctx.z_oj);  free(ctx.z_p2); free(ctx.f_p2); free(ctx.f_m2);
-    free(ctx.neg_a_z); free(ctx.dg_tmp); free(ctx.da_z_tmp);
-    free(ctx.v_ei); free(ctx.vjp_z_tmp); free(ctx.vjp_th_p); free(ctx.vjp_th_m);
+    free(ctx.z_oj); free(ctx.neg_a_z); free(ctx.dg_tmp);
+    free(ctx.vjp_th_p); free(ctx.vjp_th_m);
+    if (cnf->n_hutchinson > 0) {
+        free(ctx.v); free(ctx.vjp_z_p); free(ctx.vjp_z_m);
+    } else {
+        free(ctx.z_p2); free(ctx.f_p2); free(ctx.f_m2);
+        free(ctx.da_z_tmp); free(ctx.v_ei); free(ctx.vjp_z_tmp);
+    }
     free(ws);
     return out;
 }

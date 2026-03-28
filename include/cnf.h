@@ -7,6 +7,8 @@ typedef struct {
     DynNet *net;
     int nparams;
     double trace_eps;
+    RNG rng;
+    int n_hutchinson;  /* 0=exact trace (default), 1=Hutchinson estimator */
 } CNF;
 
 typedef struct {

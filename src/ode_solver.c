@@ -24,12 +24,13 @@ static const double dp_e[7]  = {
 ODEResult ode_solve(ode_rhs_fn f, const double *y0, double t0, double t1,
                     const double *params, int dim, double atol, double rtol,
                     void *ctx) {
-    double **k = (double **)xmalloc(7 * sizeof(double *));
-    for (int i = 0; i < 7; i++) k[i] = vec_alloc(dim);
-    double *y   = vec_alloc(dim);
-    double *y5  = vec_alloc(dim);
-    double *err = vec_alloc(dim);
-    double *stg = vec_alloc(dim);
+    double *buf = vec_alloc(11 * dim);
+    double *k[7];
+    for (int i = 0; i < 7; i++) k[i] = buf + i * dim;
+    double *y   = buf + 7 * dim;
+    double *y5  = buf + 8 * dim;
+    double *err = buf + 9 * dim;
+    double *stg = buf + 10 * dim;
 
     ODEResult res = { vec_alloc(dim), 0 };
     vec_copy(y0, y, dim);
@@ -109,13 +110,7 @@ ODEResult ode_solve(ode_rhs_fn f, const double *y0, double t0, double t1,
     }
 
     vec_copy(y, res.y, dim);
-    for (int i = 0; i < 7; i++)  free(k[i]);
-
-    free(k);
-    free(y);
-    free(y5);
-    free(err);
-    free(stg);
+    free(buf);
 
     return res;
 }
